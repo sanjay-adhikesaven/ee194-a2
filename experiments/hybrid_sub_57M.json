@@ -1,0 +1,123 @@
+{
+  "experiment_id": "hybrid_sub_57M",
+  "timestamp": "2026-03-01T11:04:07.780274+00:00",
+  "description": "Data ablation: hybrid_sub_57M",
+  "config_path": "configs/hybrid_sub_57M.yaml",
+  "data": {
+    "path": "/home/sanjay/ee194-a2/data/hybrid_subsample_328M.jsonl"
+  },
+  "tokenizer": {
+    "type": "byte-level BPE (HuggingFace tokenizers)",
+    "vocab_size": 16384,
+    "trained_on": "hybrid pre-training corpus",
+    "dir": "tokenizer_16k"
+  },
+  "model": {
+    "family": "Nemotron-Nano-V3 (dense, scaled down)",
+    "vocab_size": 16384,
+    "hidden_size": 576,
+    "num_layers": 10,
+    "num_attention_heads": 8,
+    "num_kv_heads": 2,
+    "intermediate_size": 2304,
+    "max_position_embeddings": 2048,
+    "rms_norm_eps": 1e-05,
+    "rope_theta": 10000.0,
+    "initializer_range": 0.02,
+    "tie_word_embeddings": true,
+    "total_params_tied": 57556800,
+    "embedding_params": 9437184,
+    "non_embedding_params": 48119616
+  },
+  "training": {
+    "epochs": 3,
+    "batch_size_per_gpu": 32,
+    "gradient_accumulation_steps": 2,
+    "num_gpus": 8,
+    "global_batch_size": 512,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.1,
+    "warmup_fraction": 0.05,
+    "dtype": "bfloat16",
+    "optimizer": "AdamW (beta1=0.9, beta2=0.95)",
+    "schedule": "linear warmup + cosine decay",
+    "best_train_loss": 4.162092487017314,
+    "best_epoch": 3,
+    "total_steps": 936
+  },
+  "eval_results": {
+    "hellaswag_acc_norm": 0.2533359888468433,
+    "piqa_acc": 0.544613710554951,
+    "winogrande_acc": 0.49329123914759276,
+    "boolq_acc": 0.3782874617737003,
+    "arc_easy_acc_norm": 0.31565656565656564,
+    "arc_challenge_acc_norm": 0.2295221843003413,
+    "sciq_acc_norm": 0.353,
+    "wikitext_word_ppl": 351.05780315662247,
+    "wikitext_bits_per_byte": 1.5812328820414134,
+    "lambada_ppl": 50839.51116008825
+  },
+  "eval_results_full": {
+    "arc_challenge": {
+      "alias": "arc_challenge",
+      "acc,none": 0.1697952218430034,
+      "acc_stderr,none": 0.01097177515778419,
+      "acc_norm,none": 0.2295221843003413,
+      "acc_norm_stderr,none": 0.012288926760890767
+    },
+    "arc_easy": {
+      "alias": "arc_easy",
+      "acc,none": 0.34175084175084175,
+      "acc_stderr,none": 0.009732359564894587,
+      "acc_norm,none": 0.31565656565656564,
+      "acc_norm_stderr,none": 0.00953701924556607
+    },
+    "boolq": {
+      "alias": "boolq",
+      "acc,none": 0.3782874617737003,
+      "acc_stderr,none": 0.008482001133931
+    },
+    "hellaswag": {
+      "alias": "hellaswag",
+      "acc,none": 0.2584146584345748,
+      "acc_stderr,none": 0.004368684255626143,
+      "acc_norm,none": 0.2533359888468433,
+      "acc_norm_stderr,none": 0.004340328204135165
+    },
+    "lambada_openai": {
+      "alias": "lambada_openai",
+      "perplexity,none": 50839.51116008825,
+      "perplexity_stderr,none": 2640.4784885833824,
+      "acc,none": 1.0,
+      "acc_stderr,none": 0.0
+    },
+    "piqa": {
+      "alias": "piqa",
+      "acc,none": 0.544613710554951,
+      "acc_stderr,none": 0.011619292444157082,
+      "acc_norm,none": 0.5212187159956474,
+      "acc_norm_stderr,none": 0.01165531473228886
+    },
+    "sciq": {
+      "alias": "sciq",
+      "acc,none": 0.352,
+      "acc_stderr,none": 0.015110404505648668,
+      "acc_norm,none": 0.353,
+      "acc_norm_stderr,none": 0.015120172605483697
+    },
+    "wikitext": {
+      "alias": "wikitext",
+      "word_perplexity,none": 351.05780315662247,
+      "word_perplexity_stderr,none": "N/A",
+      "byte_perplexity,none": 2.992254492041902,
+      "byte_perplexity_stderr,none": "N/A",
+      "bits_per_byte,none": 1.5812328820414134,
+      "bits_per_byte_stderr,none": "N/A"
+    },
+    "winogrande": {
+      "alias": "winogrande",
+      "acc,none": 0.49329123914759276,
+      "acc_stderr,none": 0.014051220692330349
+    }
+  }
+}
