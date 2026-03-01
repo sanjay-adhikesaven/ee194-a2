@@ -301,20 +301,37 @@ class PretrainDataset(Dataset):
         return chunk[:-1], chunk[1:]
 
 
+def _iter_jsonl_files(data_path: str):
+    """Yield file paths: if data_path is a file, yield it; if a directory,
+    yield all .jsonl files sorted by name."""
+    p = Path(data_path)
+    if p.is_file():
+        yield p
+    elif p.is_dir():
+        for f in sorted(p.glob("*.jsonl")):
+            yield f
+    else:
+        raise FileNotFoundError(f"Data path not found: {data_path}")
+
+
 def load_and_tokenize(data_path: str, tokenizer, seq_len: int, eos_id: int, rank: int):
-    """Load JSONL, tokenize all documents, concatenate with EOS separators."""
+    """Load JSONL file(s), tokenize all documents, concatenate with EOS separators.
+    data_path can be a single .jsonl file or a directory of .jsonl shards."""
     all_ids = []
     count = 0
-    with open(data_path) as f:
-        for line in f:
-            doc = json.loads(line)
-            ids = tokenizer.encode(doc["text"]).ids
-            all_ids.extend(ids)
-            all_ids.append(eos_id)
-            count += 1
-            if rank == 0 and count % 100_000 == 0:
-                print(f"  Tokenized {count:,} docs ({len(all_ids):,} tokens)...",
-                      flush=True)
+    for fpath in _iter_jsonl_files(data_path):
+        if rank == 0:
+            print(f"  Reading {fpath.name} ...", flush=True)
+        with open(fpath) as f:
+            for line in f:
+                doc = json.loads(line)
+                ids = tokenizer.encode(doc["text"]).ids
+                all_ids.extend(ids)
+                all_ids.append(eos_id)
+                count += 1
+                if rank == 0 and count % 100_000 == 0:
+                    print(f"  Tokenized {count:,} docs ({len(all_ids):,} tokens)...",
+                          flush=True)
     return all_ids
 
 

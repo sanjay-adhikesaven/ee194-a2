@@ -1,0 +1,125 @@
+{
+  "experiment_id": "scaled_38M",
+  "timestamp": "2026-03-01T00:43:16Z",
+  "description": "Scaled model A: 38.8M params, 378M tokens, 2 epochs (Chinchilla tok/param ~19.5)",
+  "config_path": "configs/scaled_38M.yaml",
+  "data": {
+    "path": "/home/jason/ee194-a2/partb_data_designer_exports/partb_hybrid_training_data.jsonl",
+    "num_documents": 399422,
+    "total_tokens": 378166240,
+    "sequences_2048": 184651
+  },
+  "tokenizer": {
+    "type": "byte-level BPE (HuggingFace tokenizers)",
+    "vocab_size": 16384,
+    "trained_on": "hybrid pre-training corpus",
+    "dir": "tokenizer_16k"
+  },
+  "model": {
+    "family": "Nemotron-Nano-V3 (dense, scaled down)",
+    "vocab_size": 16384,
+    "hidden_size": 512,
+    "num_layers": 8,
+    "num_attention_heads": 8,
+    "num_kv_heads": 2,
+    "intermediate_size": 2048,
+    "max_position_embeddings": 2048,
+    "total_params_tied": 38806016,
+    "embedding_params": 8388608,
+    "non_embedding_params": 30417408
+  },
+  "training": {
+    "epochs": 2,
+    "batch_size_per_gpu": 32,
+    "gradient_accumulation_steps": 2,
+    "num_gpus": 8,
+    "global_batch_size": 512,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.1,
+    "warmup_fraction": 0.05,
+    "dtype": "bfloat16",
+    "optimizer": "AdamW (beta1=0.9, beta2=0.95)",
+    "schedule": "linear warmup + cosine decay",
+    "best_train_loss": 4.6071,
+    "best_epoch": 2,
+    "total_steps": 720,
+    "tokens_per_param_ratio": 19.5,
+    "training_time_seconds": 832,
+    "peak_tok_per_sec": 7042503
+  },
+  "eval_results": {
+    "hellaswag_acc_norm": 0.2517426807408883,
+    "piqa_acc": 0.5413492927094669,
+    "winogrande_acc": 0.4972375690607735,
+    "boolq_acc": 0.41529051987767585,
+    "arc_easy_acc_norm": 0.2996632996632997,
+    "arc_challenge_acc_norm": 0.2226962457337884,
+    "sciq_acc_norm": 0.296,
+    "wikitext_word_ppl": 595.4871052977669,
+    "wikitext_bits_per_byte": 1.723798325604491,
+    "lambada_ppl": 261318.10667127775
+  },
+  "eval_results_full": {
+    "arc_challenge": {
+      "alias": "arc_challenge",
+      "acc,none": 0.17406143344709898,
+      "acc_stderr,none": 0.011080177129482213,
+      "acc_norm,none": 0.2226962457337884,
+      "acc_norm_stderr,none": 0.012158314774829914
+    },
+    "arc_easy": {
+      "alias": "arc_easy",
+      "acc,none": 0.31523569023569026,
+      "acc_stderr,none": 0.00953358936850585,
+      "acc_norm,none": 0.2996632996632997,
+      "acc_norm_stderr,none": 0.009400228586205971
+    },
+    "boolq": {
+      "alias": "boolq",
+      "acc,none": 0.41529051987767585,
+      "acc_stderr,none": 0.008618637526341674
+    },
+    "hellaswag": {
+      "alias": "hellaswag",
+      "acc,none": 0.2568213503286198,
+      "acc_stderr,none": 0.004359871519639558,
+      "acc_norm,none": 0.2517426807408883,
+      "acc_norm_stderr,none": 0.004331271717773873
+    },
+    "lambada_openai": {
+      "alias": "lambada_openai",
+      "perplexity,none": 261318.10667127775,
+      "perplexity_stderr,none": 16416.02531242213,
+      "acc,none": 1.0,
+      "acc_stderr,none": 0.0
+    },
+    "piqa": {
+      "alias": "piqa",
+      "acc,none": 0.5413492927094669,
+      "acc_stderr,none": 0.011625864113315815,
+      "acc_norm,none": 0.5119695321001088,
+      "acc_norm_stderr,none": 0.011662480968070047
+    },
+    "sciq": {
+      "alias": "sciq",
+      "acc,none": 0.273,
+      "acc_stderr,none": 0.01409502286871758,
+      "acc_norm,none": 0.296,
+      "acc_norm_stderr,none": 0.014442734941575027
+    },
+    "wikitext": {
+      "alias": "wikitext",
+      "word_perplexity,none": 595.4871052977669,
+      "word_perplexity_stderr,none": "N/A",
+      "byte_perplexity,none": 3.303048894135981,
+      "byte_perplexity_stderr,none": "N/A",
+      "bits_per_byte,none": 1.723798325604491,
+      "bits_per_byte_stderr,none": "N/A"
+    },
+    "winogrande": {
+      "alias": "winogrande",
+      "acc,none": 0.4972375690607735,
+      "acc_stderr,none": 0.014052271211616441
+    }
+  }
+}
