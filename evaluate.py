@@ -1,29 +1,20 @@
 """
-evaluate.py — Evaluate the pre-trained Nemotron-Nano-V3-Micro model using
+evaluate.py — Evaluate any pre-trained Nemotron-Nano model checkpoint using
 lm-evaluation-harness (EleutherAI) with a custom LM wrapper.
 
-Parallelizes across all available GPUs by sharding eval examples.
+Works with the config-driven pretrain.py — reads model_config from the
+checkpoint itself, so the same script handles all model sizes.
 
-Benchmarks (0-shot, appropriate for a small pre-trained base model):
-  - hellaswag          : commonsense NLI (4-way, loglikelihood)
-  - piqa               : physical intuition QA (2-way, loglikelihood)
-  - arc_easy           : grade-school science (loglikelihood)
-  - arc_challenge      : grade-school science hard (loglikelihood)
-  - winogrande         : coreference resolution (loglikelihood)
-  - sciq               : science QA (loglikelihood)
-  - boolq              : boolean QA (loglikelihood)
-  - lambada_openai     : last-word prediction (loglikelihood)
-  - wikitext           : perplexity (loglikelihood_rolling)
+Parallelizes across all available GPUs by replicating the model.
 
-All tasks use loglikelihood-based evaluation (no slow autoregressive generation).
+Benchmarks (0-shot):
+  - hellaswag, piqa, arc_easy, arc_challenge, winogrande
+  - sciq, boolq, lambada_openai, wikitext
 
 Usage:
-  python evaluate.py                           # evaluate checkpoints/best.pt
-  python evaluate.py --checkpoint path/to.pt   # evaluate a specific checkpoint
-  python evaluate.py --tasks hellaswag,piqa    # run specific tasks only
-
-Multi-GPU: automatically distributes across all visible GPUs.
-  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python evaluate.py
+  python evaluate.py --checkpoint runs/scaled_38M/best.pt
+  python evaluate.py --checkpoint runs/scaled_38M/best.pt --tasks hellaswag,piqa
+  python evaluate.py --checkpoint runs/scaled_38M/best.pt --output experiments/scaled_38M_eval.json
 """
 
 import argparse
@@ -43,8 +34,8 @@ from lm_eval.api.instance import Instance
 
 sys.path.insert(0, os.path.dirname(__file__))
 from pretrain import (
-    ModelConfig, NemotronNanoMicro, load_tokenizer,
-    EOS_TOKEN, PAD_TOKEN, TOKENIZER_DIR,
+    ModelConfig, NemotronNano, load_tokenizer,
+    EOS_TOKEN, PAD_TOKEN,
 )
 
 # ---------------------------------------------------------------------------
@@ -54,23 +45,22 @@ from pretrain import (
 class NemotronNanoEvalLM(LM):
     """Wraps our custom model for the lm-eval-harness evaluation interface.
 
-    Supports multi-GPU by replicating the model on each GPU and distributing
-    requests round-robin across devices.
+    Reads model_config from the checkpoint, so it auto-adapts to any model size.
+    Supports multi-GPU by replicating the model on each GPU.
     """
 
-    def __init__(self, checkpoint_path: str, tokenizer_dir: str = TOKENIZER_DIR,
+    def __init__(self, checkpoint_path: str, tokenizer_dir: str = "tokenizer_16k",
                  batch_size: int = 64):
         super().__init__()
 
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         mcfg = ModelConfig(**ckpt["model_config"])
 
-        # Replicate model on all available GPUs
         self.num_gpus = torch.cuda.device_count()
         self.models = []
         for gpu_id in range(self.num_gpus):
             device = torch.device(f"cuda:{gpu_id}")
-            model = NemotronNanoMicro(mcfg)
+            model = NemotronNano(mcfg)
             model.load_state_dict(ckpt["model_state_dict"])
             model = model.to(device).eval()
             self.models.append(model)
@@ -83,12 +73,18 @@ class NemotronNanoEvalLM(LM):
         self._vocab_size = mcfg.vocab_size
         self._device = torch.device("cuda:0")
 
+        experiment_id = ckpt.get("experiment_id", "unknown")
         epoch = ckpt.get("epoch", "?")
         loss = ckpt.get("loss", "?")
-        print(f"Loaded checkpoint: {checkpoint_path} (epoch {epoch}, loss {loss})")
-        print(f"Model: {mcfg.hidden_size}h, {mcfg.num_layers}L, "
+        param_info = self.models[0].count_parameters()
+        print(f"Loaded: {checkpoint_path}")
+        print(f"  Experiment : {experiment_id}")
+        print(f"  Epoch/loss : {epoch} / {loss}")
+        print(f"  Model      : {mcfg.hidden_size}h, {mcfg.num_layers}L, "
               f"{mcfg.vocab_size} vocab, {self._max_length} ctx")
-        print(f"Eval GPUs: {self.num_gpus}")
+        print(f"  Params     : {param_info['total_with_tying']:,} total "
+              f"({param_info['non_embedding']:,} non-embed)")
+        print(f"  Eval GPUs  : {self.num_gpus}")
 
     @property
     def eot_token_id(self):
@@ -117,12 +113,9 @@ class NemotronNanoEvalLM(LM):
         return self.tokenizer.decode(tokens)
 
     def _get_logprobs(self, input_ids_list: list[list[int]]) -> list[torch.Tensor]:
-        """Compute per-token log-probs for a batch of sequences, distributed
-        across all GPUs. Returns list of 1-D tensors (one per sequence) with
-        log-probs for positions 1..T (shifted)."""
+        """Compute per-token log-probs distributed across all GPUs."""
         results: list[Optional[torch.Tensor]] = [None] * len(input_ids_list)
 
-        # Pad sequences to same length within each GPU's sub-batch
         gpu_batches: list[list[tuple[int, list[int]]]] = [[] for _ in range(self.num_gpus)]
         for i, ids in enumerate(input_ids_list):
             gpu_batches[i % self.num_gpus].append((i, ids))
@@ -137,11 +130,10 @@ class NemotronNanoEvalLM(LM):
             seqs = [b[1] for b in batch]
             max_len = min(max(len(s) for s in seqs), self._max_length)
 
-            # Right-pad with pad token
             padded = []
             lengths = []
             for s in seqs:
-                s = s[-max_len:]  # truncate from left
+                s = s[-max_len:]
                 lengths.append(len(s))
                 padded.append(s + [self._pad_id] * (max_len - len(s)))
 
@@ -150,7 +142,6 @@ class NemotronNanoEvalLM(LM):
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 logits = model(input_tensor)
 
-            # Compute log-probs for each sequence (unpadded)
             for j, (idx, seq_len) in enumerate(zip(indices, lengths)):
                 if seq_len < 2:
                     results[idx] = torch.tensor([], device="cpu")
@@ -164,7 +155,6 @@ class NemotronNanoEvalLM(LM):
         return results
 
     def loglikelihood(self, requests: list[Instance]) -> list[tuple[float, bool]]:
-        # Prepare all sequences
         all_ids = []
         cont_lens = []
         for req in requests:
@@ -176,7 +166,6 @@ class NemotronNanoEvalLM(LM):
             all_ids.append(full_ids)
             cont_lens.append(cont_len)
 
-        # Process in batches across GPUs
         results = []
         for batch_start in range(0, len(all_ids), self._batch_size):
             batch_ids = all_ids[batch_start:batch_start + self._batch_size]
@@ -189,19 +178,14 @@ class NemotronNanoEvalLM(LM):
                     continue
                 cont_lps = token_lps[-cont_len:]
                 ll = cont_lps.sum().item()
-
-                # Check greedy: reconstruct what argmax would have predicted
-                # We need the logits for this — approximate by checking if
-                # log-prob equals max log-prob (i.e., token was top-1)
-                is_greedy = True  # approximate
-                results.append((ll, is_greedy))
+                results.append((ll, True))
 
         return results
 
     def loglikelihood_rolling(self, requests: list[Instance]) -> list[float]:
         results = []
-        all_chunks = []  # (request_idx, token_ids)
-        req_chunk_map = []  # maps request_idx -> list of chunk indices
+        all_chunks = []
+        req_chunk_map = []
 
         for req_idx, req in enumerate(requests):
             (string,) = req.args
@@ -217,14 +201,12 @@ class NemotronNanoEvalLM(LM):
 
             req_chunk_map.append(chunk_indices)
 
-        # Process all chunks in batches
         all_lps = []
         for batch_start in range(0, len(all_chunks), self._batch_size):
             batch = all_chunks[batch_start:batch_start + self._batch_size]
             batch_lps = self._get_logprobs(batch)
             all_lps.extend(batch_lps)
 
-        # Aggregate per request
         for req_idx, chunk_indices in enumerate(req_chunk_map):
             total_ll = sum(all_lps[ci].sum().item() for ci in chunk_indices)
             results.append(total_ll)
@@ -232,7 +214,7 @@ class NemotronNanoEvalLM(LM):
         return results
 
     def generate_until(self, requests: list[Instance]) -> list[str]:
-        """Minimal implementation — most benchmarks don't need this."""
+        """Minimal implementation for tasks that require generation."""
         results = []
         for req in requests:
             context, gen_kwargs = req.args
@@ -243,7 +225,6 @@ class NemotronNanoEvalLM(LM):
             if len(ctx_ids) > self._max_length - max_gen:
                 ctx_ids = ctx_ids[-(self._max_length - max_gen):]
 
-            device = self.models[0].cfg.tie_word_embeddings  # just use GPU 0
             input_ids = torch.tensor([ctx_ids], device=torch.device("cuda:0"))
 
             generated = []
@@ -287,12 +268,19 @@ DEFAULT_TASKS = [
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate pre-trained model")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/best.pt")
-    parser.add_argument("--tokenizer_dir", type=str, default=TOKENIZER_DIR)
+    parser.add_argument("--checkpoint", type=str, required=True,
+                        help="Path to checkpoint (e.g. runs/scaled_38M/best.pt)")
+    parser.add_argument("--tokenizer_dir", type=str, default="tokenizer_16k")
     parser.add_argument("--tasks", type=str, default=",".join(DEFAULT_TASKS))
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--output", type=str, default="eval_results.json")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Output path for results JSON. Defaults to <run_dir>/eval_results.json")
     args = parser.parse_args()
+
+    # Default output: same directory as checkpoint
+    if args.output is None:
+        ckpt_dir = Path(args.checkpoint).parent
+        args.output = str(ckpt_dir / "eval_results.json")
 
     task_list = [t.strip() for t in args.tasks.split(",")]
     print(f"Tasks: {task_list}")
@@ -327,6 +315,7 @@ def main():
     print(f"Evaluation completed in {elapsed:.1f}s")
 
     output_path = Path(args.output)
+    os.makedirs(output_path.parent, exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(results["results"], f, indent=2, default=str)
     print(f"Full results saved to {output_path}")

@@ -1,0 +1,39 @@
+# Scaled A: 38.8M params, 378M tokens, 2 epochs
+# Chinchilla tok/param: 19.5
+
+experiment_id: scaled_38M
+
+model:
+  vocab_size: 16384
+  hidden_size: 512
+  num_layers: 8
+  num_attention_heads: 8
+  num_kv_heads: 2
+  intermediate_size: 2048
+  max_position_embeddings: 2048
+  rms_norm_eps: 1.0e-5
+  rope_theta: 10000.0
+  initializer_range: 0.02
+  tie_word_embeddings: true
+
+train:
+  data_path: /home/jason/ee194-a2/partb_data_designer_exports/partb_hybrid_training_data.jsonl
+  output_dir: runs/scaled_38M
+  tokenizer_dir: tokenizer_16k
+  batch_size: 32
+  gradient_accumulation_steps: 2
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-8
+  max_grad_norm: 1.0
+  warmup_fraction: 0.05
+  num_epochs: 2
+  dtype: bfloat16
+  compile_model: true
+  log_interval: 50
+  save_interval_epochs: 1
+  wandb_project: ee194-a2-pretrain
+  wandb_run_name: scaled_38M
+  seed: 42

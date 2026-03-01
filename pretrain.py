@@ -1,76 +1,34 @@
 """
-pretrain.py — Pre-train a scaled-down Nemotron-Nano-V3-style model from scratch.
+pretrain.py — Config-driven pre-training for Nemotron-Nano-V3-style models.
 
-Architecture
-============
-Family       : NVIDIA Nemotron-Nano-V3 (dense decoder-only transformer variant)
-               The full Nemotron-Nano-V3 is a hybrid Mamba-Transformer MoE with
-               52 layers (23 Mamba-2 + 23 MoE + 6 GQA), hidden=4096, vocab=131072.
-               At our data scale we use a dense transformer that preserves the key
-               architectural choices of the family:
-                 - Grouped-Query Attention (GQA, 4:1 ratio)
-                 - RMSNorm (pre-norm)
-                 - SwiGLU MLP (gate · up, then down)
-                 - Rotary Position Embeddings (RoPE)
-                 - Tied input/output embeddings
+Reads a YAML config file that specifies model architecture, training
+hyperparameters, and data paths. This single script handles all model sizes
+from the 4M baseline to the 57M scaled variant.
 
-Depth / Width
-=============
-  hidden_size       = 128
-  num_layers        = 8
-  num_attn_heads    = 8   (head_dim = 16)
-  num_kv_heads      = 2   (GQA ratio 4:1, same as full model)
-  intermediate_size = 512  (4× hidden, SwiGLU)
-  max_position      = 2048
+Architecture family: NVIDIA Nemotron-Nano-V3 (dense decoder-only transformer)
+  - Grouped-Query Attention (GQA)
+  - RMSNorm (pre-norm)
+  - SwiGLU MLP (gate · up, then down)
+  - Rotary Position Embeddings (RoPE)
+  - Tied input/output embeddings
 
-  Non-embedding params : ~1.90 M
-  Embedding params     : ~2.10 M  (16 384 × 128, tied with LM head)
-  Total params         : ~4.00 M
-
-Tokenizer
-=========
-  Type       : BPE (trained from scratch with HuggingFace `tokenizers`)
-  Vocab size : 16 384
-  Trained on : The hybrid pre-training corpus itself (29 074 documents,
-               ~24K real FineWiki + ~5K synthetic Data Designer rephrased)
-  Settings   : byte-level BPE, min_frequency=2, special tokens=[<|pad|>,
-               <|eos|>, <|unk|>], no pre-existing merges
-
-  Rationale  : A 16K vocab balances compression efficiency against embedding
-               table size. With only ~26M tokens of training data, a 131K
-               vocab (Nemotron-Nano-V3 default) would allocate 88% of model
-               parameters to an embedding table whose rows are mostly unseen.
-               16K keeps ~48% of params in the transformer layers.
-
-Data
-====
-  File   : /home/jason/ee194-a2/partb_data_designer_exports/partb_hybrid_training_data.jsonl
-  Split  : ~24 000 real (FineWiki) + ~5 000 synthetic (Data Designer rephrased)
-  Tokens : ~26 M (measured with the 16K BPE tokenizer)
-
-Training stack
-==============
-  Framework    : PyTorch 2.9 + HuggingFace tokenizers
-  Parallelism  : DDP across 8× NVIDIA H100 80 GB (data parallel)
-  Precision    : bfloat16 (torch.amp autocast)
-  Optimizer    : AdamW (β1=0.9, β2=0.95, eps=1e-8, weight_decay=0.1)
-  Schedule     : Linear warmup (5% of steps) → cosine decay to 0
-  Epochs       : 3 (Chinchilla-optimal: ~78M tokens seen / ~4M params ≈ 19.5 tok/param)
-  Logging      : Weights & Biases (rank 0 only)
-
-Launch
-======
-  torchrun --nproc_per_node=8 pretrain.py
+Usage:
+  torchrun --nproc_per_node=8 pretrain.py --config configs/baseline_4M.yaml
+  torchrun --nproc_per_node=8 pretrain.py --config configs/scaled_38M.yaml
+  torchrun --nproc_per_node=8 pretrain.py --config configs/scaled_57M.yaml
 """
 
+import argparse
 import os
 import json
 import math
 import time
 import random
+import shutil
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field, asdict
 
+import yaml
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -80,19 +38,17 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration (loaded from YAML)
 # ---------------------------------------------------------------------------
-
-TOKENIZER_DIR = "tokenizer_16k"
 
 @dataclass
 class ModelConfig:
     vocab_size: int = 16_384
     hidden_size: int = 128
     num_layers: int = 8
-    num_attention_heads: int = 8        # head_dim = 16
-    num_kv_heads: int = 2               # GQA 4:1
-    intermediate_size: int = 512        # 4× hidden (SwiGLU)
+    num_attention_heads: int = 8
+    num_kv_heads: int = 2
+    intermediate_size: int = 512
     max_position_embeddings: int = 2048
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10_000.0
@@ -101,14 +57,12 @@ class ModelConfig:
 
 @dataclass
 class TrainConfig:
-    data_path: str = "/home/jason/ee194-a2/partb_data_designer_exports/partb_hybrid_training_data.jsonl"
-    output_dir: str = "checkpoints"
-    tokenizer_dir: str = TOKENIZER_DIR
+    data_path: str = ""
+    output_dir: str = "runs/default"
+    tokenizer_dir: str = "tokenizer_16k"
 
-    # Per-GPU batch size; global batch = batch_size * grad_accum * world_size
     batch_size: int = 8
     gradient_accumulation_steps: int = 1
-    # With 8 GPUs: global_batch = 8 * 1 * 8 = 64 sequences/step (~131K tokens)
     learning_rate: float = 3e-4
     weight_decay: float = 0.1
     adam_beta1: float = 0.9
@@ -121,15 +75,26 @@ class TrainConfig:
     dtype: str = "bfloat16"
     compile_model: bool = True
 
-    log_interval: int = 10
+    log_interval: int = 50
     save_interval_epochs: int = 1
     wandb_project: str = "ee194-a2-pretrain"
-    wandb_run_name: str = "nemotron-nano-v3-micro"
+    wandb_run_name: str = ""
     seed: int = 42
 
 
+def load_config(config_path: str) -> tuple[str, ModelConfig, TrainConfig]:
+    """Load experiment config from YAML. Returns (experiment_id, mcfg, tcfg)."""
+    with open(config_path) as f:
+        raw = yaml.safe_load(f)
+
+    experiment_id = raw.get("experiment_id", Path(config_path).stem)
+    mcfg = ModelConfig(**raw.get("model", {}))
+    tcfg = TrainConfig(**raw.get("train", {}))
+    return experiment_id, mcfg, tcfg
+
+
 # ---------------------------------------------------------------------------
-# Tokenizer training
+# Tokenizer
 # ---------------------------------------------------------------------------
 
 PAD_TOKEN = "<|pad|>"
@@ -157,7 +122,7 @@ def train_tokenizer(data_path: str, vocab_size: int, save_dir: str):
             for line in f:
                 yield json.loads(line)["text"]
 
-    tokenizer.train_from_iterator(doc_iterator(), trainer=trainer, length=29_074)
+    tokenizer.train_from_iterator(doc_iterator(), trainer=trainer)
 
     os.makedirs(save_dir, exist_ok=True)
     tokenizer.save(os.path.join(save_dir, "tokenizer.json"))
@@ -165,7 +130,6 @@ def train_tokenizer(data_path: str, vocab_size: int, save_dir: str):
     test = tokenizer.encode("Hello world! This is a test.")
     print(f"Tokenizer trained: vocab_size={tokenizer.get_vocab_size()}, "
           f"test encode length={len(test.ids)}")
-    print(f"Saved to {save_dir}/tokenizer.json")
     return tokenizer
 
 
@@ -266,8 +230,8 @@ class TransformerBlock(nn.Module):
         return x
 
 
-class NemotronNanoMicro(nn.Module):
-    """Scaled-down Nemotron-Nano-V3-style causal language model."""
+class NemotronNano(nn.Module):
+    """Config-driven Nemotron-Nano-V3-style causal language model."""
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -337,20 +301,25 @@ class PretrainDataset(Dataset):
         return chunk[:-1], chunk[1:]
 
 
-def load_and_tokenize(data_path: str, tokenizer, seq_len: int, eos_id: int):
+def load_and_tokenize(data_path: str, tokenizer, seq_len: int, eos_id: int, rank: int):
     """Load JSONL, tokenize all documents, concatenate with EOS separators."""
     all_ids = []
+    count = 0
     with open(data_path) as f:
         for line in f:
             doc = json.loads(line)
             ids = tokenizer.encode(doc["text"]).ids
             all_ids.extend(ids)
             all_ids.append(eos_id)
+            count += 1
+            if rank == 0 and count % 100_000 == 0:
+                print(f"  Tokenized {count:,} docs ({len(all_ids):,} tokens)...",
+                      flush=True)
     return all_ids
 
 
 # ---------------------------------------------------------------------------
-# Learning-rate schedule: linear warmup → cosine decay
+# Learning-rate schedule: linear warmup -> cosine decay
 # ---------------------------------------------------------------------------
 
 def get_lr(step: int, total_steps: int, warmup_steps: int, max_lr: float) -> float:
@@ -365,8 +334,6 @@ def get_lr(step: int, total_steps: int, warmup_steps: int, max_lr: float) -> flo
 # ---------------------------------------------------------------------------
 
 def setup_distributed():
-    """Initialize DDP. Returns (rank, local_rank, world_size). Falls back to
-    single-GPU if torchrun env vars are not set."""
     if "RANK" in os.environ:
         dist.init_process_group("nccl")
         rank = dist.get_rank()
@@ -383,27 +350,41 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-def is_main(rank: int) -> bool:
-    return rank == 0
-
-
 def print0(msg: str, rank: int):
-    """Print only on rank 0."""
-    if is_main(rank):
+    if rank == 0:
         print(msg, flush=True)
+
+
+class _NullContext:
+    def __enter__(self): return self
+    def __exit__(self, *args): pass
+
+
+def open_no_sync(model, micro_step, grad_accum, world_size):
+    is_sync_step = (micro_step + 1) % grad_accum == 0
+    if world_size > 1 and not is_sync_step:
+        return model.no_sync()
+    return _NullContext()
+
+
+def unwrap_model(model):
+    m = model
+    if hasattr(m, "module"):
+        m = m.module
+    if hasattr(m, "_orig_mod"):
+        m = m._orig_mod
+    return m
 
 
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
-def train():
-    tcfg = TrainConfig()
-    mcfg = ModelConfig()
+def train(config_path: str):
+    experiment_id, mcfg, tcfg = load_config(config_path)
 
     rank, local_rank, world_size = setup_distributed()
 
-    # Seed each rank differently for data shuffling, but same model init
     random.seed(tcfg.seed)
     torch.manual_seed(tcfg.seed)
     torch.cuda.manual_seed_all(tcfg.seed)
@@ -412,13 +393,18 @@ def train():
     pt_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16,
                 "float32": torch.float32}[tcfg.dtype]
 
-    # ---- Tokenizer (rank 0 trains, others wait) ----
+    print0(f"\n{'='*60}", rank)
+    print0(f" Experiment: {experiment_id}", rank)
+    print0(f" Config:     {config_path}", rank)
+    print0(f"{'='*60}\n", rank)
+
+    # ---- Tokenizer (rank 0 trains if needed, others wait) ----
     tok_path = os.path.join(tcfg.tokenizer_dir, "tokenizer.json")
-    if is_main(rank):
+    if rank == 0:
         if os.path.exists(tok_path):
-            print(f"Loading existing tokenizer from {tcfg.tokenizer_dir} …")
+            print(f"Loading existing tokenizer from {tcfg.tokenizer_dir}")
         else:
-            print(f"Training new {mcfg.vocab_size}-token BPE tokenizer …")
+            print(f"Training new {mcfg.vocab_size}-token BPE tokenizer ...")
             train_tokenizer(tcfg.data_path, mcfg.vocab_size, tcfg.tokenizer_dir)
     if world_size > 1:
         dist.barrier()
@@ -429,13 +415,14 @@ def train():
     actual_vocab = tokenizer.get_vocab_size()
     assert actual_vocab == mcfg.vocab_size, (
         f"Tokenizer vocab {actual_vocab} != model vocab {mcfg.vocab_size}")
-    print0(f"Tokenizer ready: vocab={actual_vocab}, eos_id={eos_id}, pad_id={pad_id}", rank)
+    print0(f"Tokenizer: vocab={actual_vocab}, eos_id={eos_id}, pad_id={pad_id}", rank)
 
-    # ---- Dataset (every rank tokenizes — fast enough, avoids large tensor broadcast) ----
-    print0("Tokenizing dataset …", rank)
+    # ---- Dataset ----
+    print0("Tokenizing dataset ...", rank)
     all_ids = load_and_tokenize(tcfg.data_path, tokenizer,
-                                mcfg.max_position_embeddings, eos_id)
-    print0(f"Total tokens: {len(all_ids):,}", rank)
+                                mcfg.max_position_embeddings, eos_id, rank)
+    total_tokens = len(all_ids)
+    print0(f"Total tokens: {total_tokens:,}", rank)
     dataset = PretrainDataset(all_ids, mcfg.max_position_embeddings)
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
@@ -448,28 +435,28 @@ def train():
     steps_per_epoch = len(dataloader) // tcfg.gradient_accumulation_steps
     total_steps = steps_per_epoch * tcfg.num_epochs
     warmup_steps = int(total_steps * tcfg.warmup_fraction)
-    # Global tokens processed per optimizer step
     tokens_per_step = (tcfg.batch_size * tcfg.gradient_accumulation_steps
                        * world_size * (mcfg.max_position_embeddings - 1))
 
     print0(f"Dataset : {len(dataset):,} sequences of length {mcfg.max_position_embeddings}", rank)
-    print0(f"DDP     : {world_size} GPUs, {tcfg.batch_size}/GPU × "
+    print0(f"DDP     : {world_size} GPUs, {tcfg.batch_size}/GPU x "
            f"{tcfg.gradient_accumulation_steps} accum = "
            f"{tcfg.batch_size * tcfg.gradient_accumulation_steps * world_size} global batch", rank)
-    print0(f"Steps   : {total_steps:,} total ({steps_per_epoch}/epoch × {tcfg.num_epochs} epochs)", rank)
+    print0(f"Steps   : {total_steps:,} total ({steps_per_epoch}/epoch x {tcfg.num_epochs} epochs)", rank)
     print0(f"Warmup  : {warmup_steps:,} steps", rank)
     print0(f"Tok/step: {tokens_per_step:,}", rank)
 
     # ---- Model ----
-    print0("Initializing model …", rank)
-    model = NemotronNanoMicro(mcfg).to(device)
-    if is_main(rank):
+    print0("Initializing model ...", rank)
+    model = NemotronNano(mcfg).to(device)
+    param_info = None
+    if rank == 0:
         param_info = model.count_parameters()
         print(f"Parameters: {param_info['total_with_tying']:,} total "
               f"({param_info['embedding']:,} embed + {param_info['non_embedding']:,} non-embed)")
 
     if tcfg.compile_model and hasattr(torch, "compile"):
-        print0("Compiling model with torch.compile …", rank)
+        print0("Compiling model with torch.compile ...", rank)
         model = torch.compile(model)
 
     if world_size > 1:
@@ -493,19 +480,31 @@ def train():
 
     # ---- W&B (rank 0 only) ----
     use_wandb = False
-    if is_main(rank):
+    if rank == 0:
         try:
             import wandb
-            wandb.init(project=tcfg.wandb_project, name=tcfg.wandb_run_name, config={
-                "model": mcfg.__dict__, "train": tcfg.__dict__,
-                "param_info": param_info, "world_size": world_size,
+            run_name = tcfg.wandb_run_name or experiment_id
+            wandb.init(project=tcfg.wandb_project, name=run_name, config={
+                "experiment_id": experiment_id,
+                "model": asdict(mcfg),
+                "train": asdict(tcfg),
+                "param_info": param_info,
+                "world_size": world_size,
+                "total_tokens": total_tokens,
             })
             use_wandb = True
         except Exception as e:
             print(f"W&B init failed ({e}), continuing without logging")
 
+    # ---- Output dirs ----
+    output_dir = Path(tcfg.output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Copy config file into the run directory for reproducibility
+    if rank == 0:
+        shutil.copy2(config_path, output_dir / "config.yaml")
+
     # ---- Training ----
-    os.makedirs(tcfg.output_dir, exist_ok=True)
     global_step = 0
     best_loss = float("inf")
 
@@ -521,7 +520,6 @@ def train():
             inputs = inputs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
-            # Skip gradient all-reduce on non-sync micro-steps for efficiency
             with open_no_sync(model, micro_step, tcfg.gradient_accumulation_steps, world_size):
                 with torch.amp.autocast("cuda", dtype=pt_dtype):
                     logits = model(inputs)
@@ -548,7 +546,7 @@ def train():
                 num_steps_this_epoch += 1
                 global_step += 1
 
-                if global_step % tcfg.log_interval == 0 and is_main(rank):
+                if global_step % tcfg.log_interval == 0 and rank == 0:
                     elapsed = time.time() - t0
                     tok_per_sec = epoch_tokens / elapsed
                     ppl = math.exp(min(step_loss, 20.0))
@@ -556,6 +554,7 @@ def train():
                           f"loss {step_loss:.4f} | ppl {ppl:.2f} | "
                           f"lr {lr:.2e} | {tok_per_sec:.0f} tok/s")
                     if use_wandb:
+                        import wandb
                         wandb.log({
                             "train/loss": step_loss,
                             "train/perplexity": ppl,
@@ -567,40 +566,44 @@ def train():
 
         avg_loss = epoch_loss / max(num_steps_this_epoch, 1)
         avg_ppl = math.exp(min(avg_loss, 20.0))
-        print0(f"Epoch {epoch+1}/{tcfg.num_epochs} — avg loss {avg_loss:.4f}, ppl {avg_ppl:.2f}", rank)
+        print0(f"Epoch {epoch+1}/{tcfg.num_epochs} -- avg loss {avg_loss:.4f}, ppl {avg_ppl:.2f}", rank)
 
         # Checkpointing (rank 0 only)
-        if is_main(rank) and (epoch + 1) % tcfg.save_interval_epochs == 0:
+        if rank == 0 and (epoch + 1) % tcfg.save_interval_epochs == 0:
             raw = unwrap_model(model)
-            ckpt_path = Path(tcfg.output_dir) / f"epoch_{epoch+1}.pt"
+            ckpt_path = output_dir / f"epoch_{epoch+1}.pt"
             torch.save({
+                "experiment_id": experiment_id,
                 "epoch": epoch + 1,
                 "global_step": global_step,
                 "model_state_dict": raw.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
-                "model_config": mcfg.__dict__,
-                "train_config": tcfg.__dict__,
+                "model_config": asdict(mcfg),
+                "train_config": asdict(tcfg),
                 "loss": avg_loss,
             }, ckpt_path)
-            print(f"  Saved checkpoint → {ckpt_path}")
+            print(f"  Saved checkpoint -> {ckpt_path}")
 
-        if avg_loss < best_loss and is_main(rank):
+        if avg_loss < best_loss and rank == 0:
             best_loss = avg_loss
             raw = unwrap_model(model)
-            best_path = Path(tcfg.output_dir) / "best.pt"
+            best_path = output_dir / "best.pt"
             torch.save({
+                "experiment_id": experiment_id,
                 "epoch": epoch + 1,
                 "global_step": global_step,
                 "model_state_dict": raw.state_dict(),
-                "model_config": mcfg.__dict__,
+                "model_config": asdict(mcfg),
+                "train_config": asdict(tcfg),
                 "loss": avg_loss,
             }, best_path)
-            print(f"  New best model → {best_path} (loss {best_loss:.4f})")
+            print(f"  New best model -> {best_path} (loss {best_loss:.4f})")
 
         if world_size > 1:
             dist.barrier()
 
     print0(f"\nTraining complete. Best loss: {best_loss:.4f}", rank)
+    print0(f"Checkpoints in: {output_dir}", rank)
     if use_wandb:
         import wandb
         wandb.finish()
@@ -608,32 +611,12 @@ def train():
 
 
 # ---------------------------------------------------------------------------
-# Utilities
+# CLI
 # ---------------------------------------------------------------------------
 
-def unwrap_model(model):
-    """Get the raw model from DDP / torch.compile wrappers."""
-    m = model
-    if hasattr(m, "module"):        # DDP
-        m = m.module
-    if hasattr(m, "_orig_mod"):     # torch.compile
-        m = m._orig_mod
-    return m
-
-
-class _NullContext:
-    """Minimal no-op context manager."""
-    def __enter__(self): return self
-    def __exit__(self, *args): pass
-
-
-def open_no_sync(model, micro_step, grad_accum, world_size):
-    """Return model.no_sync() on non-sync micro-steps under DDP, else no-op."""
-    is_sync_step = (micro_step + 1) % grad_accum == 0
-    if world_size > 1 and not is_sync_step:
-        return model.no_sync()
-    return _NullContext()
-
-
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser(description="Config-driven pre-training")
+    parser.add_argument("--config", type=str, required=True,
+                        help="Path to YAML config file (e.g. configs/scaled_38M.yaml)")
+    args = parser.parse_args()
+    train(args.config)
