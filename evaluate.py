@@ -82,7 +82,10 @@ class NemotronNanoEvalLM(LM):
         print(f"  Epoch/loss : {epoch} / {loss}")
         print(f"  Model      : {mcfg.hidden_size}h, {mcfg.num_layers}L, "
               f"{mcfg.vocab_size} vocab, {self._max_length} ctx")
-        print(f"  Params     : {param_info['total_with_tying']:,} total "
+        total_key = 'total' if 'total' in param_info else 'total_with_tying'
+        active_key = 'active_per_token' if 'active_per_token' in param_info else total_key
+        print(f"  Params     : {param_info[total_key]:,} total, "
+              f"{param_info[active_key]:,} active/token "
               f"({param_info['non_embedding']:,} non-embed)")
         print(f"  Eval GPUs  : {self.num_gpus}")
 
@@ -140,7 +143,8 @@ class NemotronNanoEvalLM(LM):
             input_tensor = torch.tensor(padded, dtype=torch.long, device=device)
 
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                logits = model(input_tensor)
+                out = model(input_tensor)
+                logits = out[0] if isinstance(out, tuple) else out
 
             for j, (idx, seq_len) in enumerate(zip(indices, lengths)):
                 if seq_len < 2:
@@ -232,7 +236,8 @@ class NemotronNanoEvalLM(LM):
                 if input_ids.shape[1] >= self._max_length:
                     break
                 with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    logits = self.models[0](input_ids)
+                    out = self.models[0](input_ids)
+                    logits = out[0] if isinstance(out, tuple) else out
                 next_token = logits[0, -1, :].argmax(dim=-1).unsqueeze(0).unsqueeze(0)
                 input_ids = torch.cat([input_ids, next_token], dim=1)
                 generated.append(next_token.item())

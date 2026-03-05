@@ -1,21 +1,22 @@
 """
 pretrain.py — Config-driven pre-training for Nemotron-Nano-V3-style models.
 
-Reads a YAML config file that specifies model architecture, training
-hyperparameters, and data paths. This single script handles all model sizes
-from the 4M baseline to the 57M scaled variant.
+Supports dense and Mixture-of-Experts (MoE) architectures with FSDP2 or DDP.
 
-Architecture family: NVIDIA Nemotron-Nano-V3 (dense decoder-only transformer)
-  - Grouped-Query Attention (GQA)
+Architecture family: NVIDIA Nemotron-Nano-V3
+  - Grouped-Query Attention (GQA) with Flash SDP
   - RMSNorm (pre-norm)
   - SwiGLU MLP (gate · up, then down)
   - Rotary Position Embeddings (RoPE)
   - Tied input/output embeddings
+  - Optional top-k MoE routing
+
+Parallelism: FSDP2 (fully_shard) + torch.compile for best MFU on H100s.
+Falls back to DDP for small models or when FSDP2 is unavailable.
 
 Usage:
-  torchrun --nproc_per_node=8 pretrain.py --config configs/baseline_4M.yaml
-  torchrun --nproc_per_node=8 pretrain.py --config configs/scaled_38M.yaml
-  torchrun --nproc_per_node=8 pretrain.py --config configs/scaled_57M.yaml
+  torchrun --nproc_per_node=8 pretrain.py --config configs/dense_500M.yaml
+  torchrun --nproc_per_node=8 pretrain.py --config configs/moe_500M.yaml
 """
 
 import argparse
@@ -33,12 +34,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset
 from torch.utils.data.distributed import DistributedSampler
 
 # ---------------------------------------------------------------------------
-# Configuration (loaded from YAML)
+# Configuration
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -55,6 +55,12 @@ class ModelConfig:
     initializer_range: float = 0.02
     tie_word_embeddings: bool = True
 
+    # MoE config (set num_experts > 0 to enable)
+    num_experts: int = 0
+    num_experts_per_tok: int = 2
+    moe_aux_loss_coeff: float = 0.01
+
+
 @dataclass
 class TrainConfig:
     data_path: str = ""
@@ -70,26 +76,28 @@ class TrainConfig:
     adam_eps: float = 1e-8
     max_grad_norm: float = 1.0
     warmup_fraction: float = 0.05
-    num_epochs: int = 3
+    num_epochs: int = 1
 
     dtype: str = "bfloat16"
     compile_model: bool = True
+    use_fsdp: bool = True
 
     log_interval: int = 50
+    save_interval_steps: int = 0
     save_interval_epochs: int = 1
     wandb_project: str = "ee194-a2-pretrain"
     wandb_run_name: str = ""
     seed: int = 42
 
+    max_tokens: int = 0  # 0 = use all data; >0 = stop after this many tokens
+
 
 def load_config(config_path: str) -> tuple[str, ModelConfig, TrainConfig]:
-    """Load experiment config from YAML. Returns (experiment_id, mcfg, tcfg)."""
     with open(config_path) as f:
         raw = yaml.safe_load(f)
-
     experiment_id = raw.get("experiment_id", Path(config_path).stem)
-    mcfg = ModelConfig(**raw.get("model", {}))
-    tcfg = TrainConfig(**raw.get("train", {}))
+    mcfg = ModelConfig(**{k: v for k, v in raw.get("model", {}).items() if k in ModelConfig.__dataclass_fields__})
+    tcfg = TrainConfig(**{k: v for k, v in raw.get("train", {}).items() if k in TrainConfig.__dataclass_fields__})
     return experiment_id, mcfg, tcfg
 
 
@@ -103,30 +111,24 @@ UNK_TOKEN = "<|unk|>"
 SPECIAL_TOKENS = [PAD_TOKEN, EOS_TOKEN, UNK_TOKEN]
 
 def train_tokenizer(data_path: str, vocab_size: int, save_dir: str):
-    """Train a byte-level BPE tokenizer on the pre-training corpus."""
     from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
-
     tokenizer = Tokenizer(models.BPE(unk_token=UNK_TOKEN))
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     tokenizer.decoder = decoders.ByteLevel()
-
     trainer = trainers.BpeTrainer(
-        vocab_size=vocab_size,
-        min_frequency=2,
-        special_tokens=SPECIAL_TOKENS,
-        show_progress=True,
+        vocab_size=vocab_size, min_frequency=2,
+        special_tokens=SPECIAL_TOKENS, show_progress=True,
     )
 
     def doc_iterator():
-        with open(data_path) as f:
-            for line in f:
-                yield json.loads(line)["text"]
+        for fpath in _iter_jsonl_files(data_path):
+            with open(fpath) as f:
+                for line in f:
+                    yield json.loads(line)["text"]
 
     tokenizer.train_from_iterator(doc_iterator(), trainer=trainer)
-
     os.makedirs(save_dir, exist_ok=True)
     tokenizer.save(os.path.join(save_dir, "tokenizer.json"))
-
     test = tokenizer.encode("Hello world! This is a test.")
     print(f"Tokenizer trained: vocab_size={tokenizer.get_vocab_size()}, "
           f"test encode length={len(test.ids)}")
@@ -148,72 +150,100 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         norm = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
         return (x.float() * norm).type_as(x) * self.weight
 
 
-def precompute_rope(dim: int, max_seq_len: int, theta: float = 10_000.0):
+def precompute_rope(dim, max_seq_len, theta=10_000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     t = torch.arange(max_seq_len, dtype=torch.float32)
     freqs = torch.outer(t, freqs)
     return freqs.cos(), freqs.sin()
 
 
-def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-    """x shape: (B, n_heads, T, head_dim)."""
-    head_dim = x.shape[-1]
-    x1 = x[..., : head_dim // 2]
-    x2 = x[..., head_dim // 2 :]
+def apply_rope(x, cos, sin):
+    hd = x.shape[-1]
+    x1, x2 = x[..., :hd // 2], x[..., hd // 2:]
     cos = cos[:x.shape[2], :].unsqueeze(0).unsqueeze(0)
     sin = sin[:x.shape[2], :].unsqueeze(0).unsqueeze(0)
     return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
 
 
 class GQAttention(nn.Module):
-    """Grouped-Query Attention with RoPE."""
-
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.num_heads = cfg.num_attention_heads
         self.num_kv_heads = cfg.num_kv_heads
         self.head_dim = cfg.hidden_size // cfg.num_attention_heads
         self.num_groups = self.num_heads // self.num_kv_heads
-
         self.q_proj = nn.Linear(cfg.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, cfg.hidden_size, bias=False)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    def forward(self, x, cos, sin):
         B, T, _ = x.shape
-
         q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
-
+        q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         k = k.repeat_interleave(self.num_groups, dim=1)
         v = v.repeat_interleave(self.num_groups, dim=1)
-
         attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        attn = attn.transpose(1, 2).contiguous().view(B, T, -1)
-        return self.o_proj(attn)
+        return self.o_proj(attn.transpose(1, 2).contiguous().view(B, T, -1))
 
 
 class SwiGLUMLP(nn.Module):
-    """SwiGLU: out = down(silu(gate(x)) * up(x))."""
-
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.gate_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
         self.up_proj   = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
         self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class MoELayer(nn.Module):
+    """Top-k Mixture of Experts with load-balancing auxiliary loss."""
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.num_experts = cfg.num_experts
+        self.top_k = cfg.num_experts_per_tok
+        self.aux_loss_coeff = cfg.moe_aux_loss_coeff
+
+        self.gate = nn.Linear(cfg.hidden_size, cfg.num_experts, bias=False)
+        self.experts = nn.ModuleList([SwiGLUMLP(cfg) for _ in range(cfg.num_experts)])
+
+    def forward(self, x):
+        B, T, D = x.shape
+        x_flat = x.view(-1, D)
+        router_logits = self.gate(x_flat)
+        routing_weights = F.softmax(router_logits, dim=-1)
+        topk_weights, topk_indices = torch.topk(routing_weights, self.top_k, dim=-1)
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+        out = torch.zeros_like(x_flat)
+        for i, expert in enumerate(self.experts):
+            mask = (topk_indices == i).any(dim=-1)
+            if mask.any():
+                expert_input = x_flat[mask]
+                expert_out = expert(expert_input)
+                weight_for_expert = topk_weights[mask] * (topk_indices[mask] == i).float()
+                weight_sum = weight_for_expert.sum(dim=-1, keepdim=True)
+                out[mask] += expert_out * weight_sum
+
+        # Load-balancing auxiliary loss
+        tokens_per_expert = torch.zeros(self.num_experts, device=x.device)
+        for i in range(self.num_experts):
+            tokens_per_expert[i] = (topk_indices == i).any(dim=-1).float().sum()
+        tokens_per_expert = tokens_per_expert / (B * T)
+        avg_routing = routing_weights.mean(dim=0)
+        aux_loss = self.aux_loss_coeff * self.num_experts * (tokens_per_expert * avg_routing).sum()
+
+        return out.view(B, T, D), aux_loss
 
 
 class TransformerBlock(nn.Module):
@@ -222,17 +252,24 @@ class TransformerBlock(nn.Module):
         self.attn_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.attn = GQAttention(cfg)
         self.mlp_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
-        self.mlp = SwiGLUMLP(cfg)
+        self.use_moe = cfg.num_experts > 0
+        if self.use_moe:
+            self.mlp = MoELayer(cfg)
+        else:
+            self.mlp = SwiGLUMLP(cfg)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    def forward(self, x, cos, sin):
         x = x + self.attn(self.attn_norm(x), cos, sin)
-        x = x + self.mlp(self.mlp_norm(x))
-        return x
+        if self.use_moe:
+            mlp_out, aux_loss = self.mlp(self.mlp_norm(x))
+            x = x + mlp_out
+            return x, aux_loss
+        else:
+            x = x + self.mlp(self.mlp_norm(x))
+            return x, torch.tensor(0.0, device=x.device)
 
 
 class NemotronNano(nn.Module):
-    """Config-driven Nemotron-Nano-V3-style causal language model."""
-
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
@@ -246,12 +283,10 @@ class NemotronNano(nn.Module):
 
         rope_cos, rope_sin = precompute_rope(
             cfg.hidden_size // cfg.num_attention_heads,
-            cfg.max_position_embeddings,
-            cfg.rope_theta,
+            cfg.max_position_embeddings, cfg.rope_theta,
         )
         self.register_buffer("rope_cos", rope_cos, persistent=False)
         self.register_buffer("rope_sin", rope_sin, persistent=False)
-
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -262,12 +297,15 @@ class NemotronNano(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=self.cfg.initializer_range)
 
-    def forward(self, input_ids: torch.Tensor):
+    def forward(self, input_ids):
         x = self.embed_tokens(input_ids)
+        total_aux_loss = torch.tensor(0.0, device=x.device)
         for layer in self.layers:
-            x = layer(x, self.rope_cos, self.rope_sin)
+            x, aux = layer(x, self.rope_cos, self.rope_sin)
+            total_aux_loss = total_aux_loss + aux
         x = self.norm(x)
-        return self.lm_head(x)
+        logits = self.lm_head(x)
+        return logits, total_aux_loss
 
     def count_parameters(self):
         seen = {}
@@ -277,21 +315,32 @@ class NemotronNano(nn.Module):
                 seen[pid] = p.numel()
         unique = sum(seen.values())
         embed = self.embed_tokens.weight.numel()
-        return {"total_with_tying": unique, "embedding": embed,
-                "non_embedding": unique - embed}
+
+        active = unique
+        if self.cfg.num_experts > 0:
+            expert_params = 0
+            for layer in self.layers:
+                if hasattr(layer.mlp, 'experts'):
+                    for expert in layer.mlp.experts:
+                        for p in expert.parameters():
+                            expert_params += p.numel()
+            active_expert_frac = self.cfg.num_experts_per_tok / self.cfg.num_experts
+            inactive_expert_params = expert_params * (1 - active_expert_frac)
+            active = unique - int(inactive_expert_params)
+
+        return {"total": unique, "active_per_token": active,
+                "embedding": embed, "non_embedding": unique - embed}
 
 
 # ---------------------------------------------------------------------------
-# Dataset
+# Dataset — supports both in-memory and streaming
 # ---------------------------------------------------------------------------
 
 class PretrainDataset(Dataset):
-    """Packs tokenized documents into fixed-length chunks for causal LM training."""
-
     def __init__(self, token_ids: list[int], seq_len: int):
         self.seq_len = seq_len
         n = len(token_ids) // seq_len
-        self.data = torch.tensor(token_ids[: n * seq_len], dtype=torch.long).view(n, seq_len)
+        self.data = torch.tensor(token_ids[:n * seq_len], dtype=torch.long).view(n, seq_len)
 
     def __len__(self):
         return len(self.data)
@@ -301,9 +350,60 @@ class PretrainDataset(Dataset):
         return chunk[:-1], chunk[1:]
 
 
+class StreamingPretrainDataset(IterableDataset):
+    """Streams tokenized chunks from sharded JSONL files without loading all into memory."""
+
+    def __init__(self, data_path: str, tokenizer, seq_len: int, eos_id: int,
+                 rank: int, world_size: int, seed: int, epoch: int = 0,
+                 max_tokens: int = 0):
+        self.data_path = data_path
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.eos_id = eos_id
+        self.rank = rank
+        self.world_size = world_size
+        self.seed = seed
+        self.epoch = epoch
+        self.max_tokens = max_tokens
+
+    def __iter__(self):
+        files = list(_iter_jsonl_files(self.data_path))
+        rng = random.Random(self.seed + self.epoch)
+        rng.shuffle(files)
+
+        # Shard files across workers
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            total_workers = self.world_size * worker_info.num_workers
+            worker_id = self.rank * worker_info.num_workers + worker_info.id
+        else:
+            total_workers = self.world_size
+            worker_id = self.rank
+
+        my_files = [f for i, f in enumerate(files) if i % total_workers == worker_id]
+
+        buffer = []
+        total_tokens_yielded = 0
+        for fpath in my_files:
+            with open(fpath) as f:
+                for line in f:
+                    doc = json.loads(line)
+                    ids = self.tokenizer.encode(doc["text"]).ids
+                    buffer.extend(ids)
+                    buffer.append(self.eos_id)
+
+                    while len(buffer) >= self.seq_len:
+                        chunk = buffer[:self.seq_len]
+                        buffer = buffer[self.seq_len:]
+                        t = torch.tensor(chunk, dtype=torch.long)
+                        total_tokens_yielded += self.seq_len
+                        yield t[:-1], t[1:]
+
+                        if self.max_tokens > 0 and total_tokens_yielded >= self.max_tokens // self.world_size:
+                            return
+
+
 def _iter_jsonl_files(data_path: str):
-    """Yield file paths: if data_path is a file, yield it; if a directory,
-    yield all .jsonl files sorted by name."""
     p = Path(data_path)
     if p.is_file():
         yield p
@@ -315,8 +415,6 @@ def _iter_jsonl_files(data_path: str):
 
 
 def load_and_tokenize(data_path: str, tokenizer, seq_len: int, eos_id: int, rank: int):
-    """Load JSONL file(s), tokenize all documents, concatenate with EOS separators.
-    data_path can be a single .jsonl file or a directory of .jsonl shards."""
     all_ids = []
     count = 0
     for fpath in _iter_jsonl_files(data_path):
@@ -330,16 +428,15 @@ def load_and_tokenize(data_path: str, tokenizer, seq_len: int, eos_id: int, rank
                 all_ids.append(eos_id)
                 count += 1
                 if rank == 0 and count % 100_000 == 0:
-                    print(f"  Tokenized {count:,} docs ({len(all_ids):,} tokens)...",
-                          flush=True)
+                    print(f"  Tokenized {count:,} docs ({len(all_ids):,} tokens)...", flush=True)
     return all_ids
 
 
 # ---------------------------------------------------------------------------
-# Learning-rate schedule: linear warmup -> cosine decay
+# LR schedule
 # ---------------------------------------------------------------------------
 
-def get_lr(step: int, total_steps: int, warmup_steps: int, max_lr: float) -> float:
+def get_lr(step, total_steps, warmup_steps, max_lr):
     if step < warmup_steps:
         return max_lr * (step + 1) / warmup_steps
     progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
@@ -367,21 +464,9 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-def print0(msg: str, rank: int):
+def print0(msg, rank):
     if rank == 0:
         print(msg, flush=True)
-
-
-class _NullContext:
-    def __enter__(self): return self
-    def __exit__(self, *args): pass
-
-
-def open_no_sync(model, micro_step, grad_accum, world_size):
-    is_sync_step = (micro_step + 1) % grad_accum == 0
-    if world_size > 1 and not is_sync_step:
-        return model.no_sync()
-    return _NullContext()
 
 
 def unwrap_model(model):
@@ -394,12 +479,28 @@ def unwrap_model(model):
 
 
 # ---------------------------------------------------------------------------
+# Estimate data size for streaming
+# ---------------------------------------------------------------------------
+
+def estimate_tokens_from_manifest(data_path: str):
+    """Try to read _manifest.json to estimate total tokens."""
+    p = Path(data_path)
+    if p.is_dir():
+        manifest = p / "_manifest.json"
+        if manifest.exists():
+            with open(manifest) as f:
+                m = json.load(f)
+            total_rows = m.get("total_rows", 0)
+            return total_rows * 2300  # ~2300 tokens/doc average for this corpus
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
 def train(config_path: str):
     experiment_id, mcfg, tcfg = load_config(config_path)
-
     rank, local_rank, world_size = setup_distributed()
 
     random.seed(tcfg.seed)
@@ -413,9 +514,13 @@ def train(config_path: str):
     print0(f"\n{'='*60}", rank)
     print0(f" Experiment: {experiment_id}", rank)
     print0(f" Config:     {config_path}", rank)
+    print0(f" Parallelism: {'FSDP2' if tcfg.use_fsdp else 'DDP'} + "
+           f"{'compile' if tcfg.compile_model else 'no-compile'}", rank)
+    if mcfg.num_experts > 0:
+        print0(f" MoE: {mcfg.num_experts} experts, top-{mcfg.num_experts_per_tok}", rank)
     print0(f"{'='*60}\n", rank)
 
-    # ---- Tokenizer (rank 0 trains if needed, others wait) ----
+    # ---- Tokenizer ----
     tok_path = os.path.join(tcfg.tokenizer_dir, "tokenizer.json")
     if rank == 0:
         if os.path.exists(tok_path):
@@ -435,32 +540,46 @@ def train(config_path: str):
     print0(f"Tokenizer: vocab={actual_vocab}, eos_id={eos_id}, pad_id={pad_id}", rank)
 
     # ---- Dataset ----
-    print0("Tokenizing dataset ...", rank)
-    all_ids = load_and_tokenize(tcfg.data_path, tokenizer,
-                                mcfg.max_position_embeddings, eos_id, rank)
-    total_tokens = len(all_ids)
-    print0(f"Total tokens: {total_tokens:,}", rank)
-    dataset = PretrainDataset(all_ids, mcfg.max_position_embeddings)
+    data_path = Path(tcfg.data_path)
+    use_streaming = data_path.is_dir() and len(list(data_path.glob("*.jsonl"))) > 10
 
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
-                                 shuffle=True, seed=tcfg.seed)
-    dataloader = DataLoader(
-        dataset, batch_size=tcfg.batch_size, sampler=sampler,
-        num_workers=4, pin_memory=True, drop_last=True,
-    )
+    if use_streaming:
+        print0("Using streaming data loader (sharded dataset)", rank)
+        estimated_tokens = estimate_tokens_from_manifest(tcfg.data_path)
+        if tcfg.max_tokens > 0:
+            estimated_tokens = min(estimated_tokens, tcfg.max_tokens)
+        print0(f"Estimated tokens: ~{estimated_tokens:,}", rank)
 
-    steps_per_epoch = len(dataloader) // tcfg.gradient_accumulation_steps
-    total_steps = steps_per_epoch * tcfg.num_epochs
-    warmup_steps = int(total_steps * tcfg.warmup_fraction)
-    tokens_per_step = (tcfg.batch_size * tcfg.gradient_accumulation_steps
-                       * world_size * (mcfg.max_position_embeddings - 1))
+        seqs_per_epoch = estimated_tokens // mcfg.max_position_embeddings
+        steps_per_epoch = seqs_per_epoch // (tcfg.batch_size * tcfg.gradient_accumulation_steps * world_size)
+        total_steps = steps_per_epoch * tcfg.num_epochs
+        warmup_steps = int(total_steps * tcfg.warmup_fraction)
+        tokens_per_step = (tcfg.batch_size * tcfg.gradient_accumulation_steps
+                           * world_size * (mcfg.max_position_embeddings - 1))
+        total_tokens = estimated_tokens
+        dataloader = None  # created per-epoch
+    else:
+        print0("Tokenizing dataset (in-memory) ...", rank)
+        all_ids = load_and_tokenize(tcfg.data_path, tokenizer,
+                                    mcfg.max_position_embeddings, eos_id, rank)
+        total_tokens = len(all_ids)
+        print0(f"Total tokens: {total_tokens:,}", rank)
+        dataset = PretrainDataset(all_ids, mcfg.max_position_embeddings)
 
-    print0(f"Dataset : {len(dataset):,} sequences of length {mcfg.max_position_embeddings}", rank)
-    print0(f"DDP     : {world_size} GPUs, {tcfg.batch_size}/GPU x "
-           f"{tcfg.gradient_accumulation_steps} accum = "
-           f"{tcfg.batch_size * tcfg.gradient_accumulation_steps * world_size} global batch", rank)
-    print0(f"Steps   : {total_steps:,} total ({steps_per_epoch}/epoch x {tcfg.num_epochs} epochs)", rank)
-    print0(f"Warmup  : {warmup_steps:,} steps", rank)
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
+                                     shuffle=True, seed=tcfg.seed)
+        dataloader = DataLoader(
+            dataset, batch_size=tcfg.batch_size, sampler=sampler,
+            num_workers=4, pin_memory=True, drop_last=True,
+        )
+        steps_per_epoch = len(dataloader) // tcfg.gradient_accumulation_steps
+        total_steps = steps_per_epoch * tcfg.num_epochs
+        warmup_steps = int(total_steps * tcfg.warmup_fraction)
+        tokens_per_step = (tcfg.batch_size * tcfg.gradient_accumulation_steps
+                           * world_size * (mcfg.max_position_embeddings - 1))
+
+    print0(f"Steps/epoch: ~{steps_per_epoch:,}, Total steps: ~{total_steps:,}", rank)
+    print0(f"Warmup: {warmup_steps:,} steps", rank)
     print0(f"Tok/step: {tokens_per_step:,}", rank)
 
     # ---- Model ----
@@ -469,15 +588,24 @@ def train(config_path: str):
     param_info = None
     if rank == 0:
         param_info = model.count_parameters()
-        print(f"Parameters: {param_info['total_with_tying']:,} total "
+        print(f"Parameters: {param_info['total']:,} total, "
+              f"{param_info['active_per_token']:,} active/token "
               f"({param_info['embedding']:,} embed + {param_info['non_embedding']:,} non-embed)")
+
+    # ---- Parallelism ----
+    if tcfg.use_fsdp and world_size > 1:
+        from torch.distributed.fsdp import fully_shard
+        print0("Applying FSDP2 (fully_shard) ...", rank)
+        for layer in model.layers:
+            fully_shard(layer)
+        fully_shard(model)
+    elif world_size > 1:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        model = DDP(model, device_ids=[local_rank])
 
     if tcfg.compile_model and hasattr(torch, "compile"):
         print0("Compiling model with torch.compile ...", rank)
         model = torch.compile(model)
-
-    if world_size > 1:
-        model = DDP(model, device_ids=[local_rank])
 
     # ---- Optimizer ----
     no_decay = {"bias", "norm", "layernorm"}
@@ -493,9 +621,8 @@ def train(config_path: str):
         param_groups, lr=tcfg.learning_rate,
         betas=(tcfg.adam_beta1, tcfg.adam_beta2), eps=tcfg.adam_eps,
     )
-    scaler = torch.amp.GradScaler(enabled=(pt_dtype == torch.float16))
 
-    # ---- W&B (rank 0 only) ----
+    # ---- W&B ----
     use_wandb = False
     if rank == 0:
         try:
@@ -516,8 +643,6 @@ def train(config_path: str):
     # ---- Output dirs ----
     output_dir = Path(tcfg.output_dir)
     os.makedirs(output_dir, exist_ok=True)
-
-    # Copy config file into the run directory for reproducibility
     if rank == 0:
         shutil.copy2(config_path, output_dir / "config.yaml")
 
@@ -526,35 +651,44 @@ def train(config_path: str):
     best_loss = float("inf")
 
     for epoch in range(tcfg.num_epochs):
-        sampler.set_epoch(epoch)
+        if use_streaming:
+            stream_ds = StreamingPretrainDataset(
+                tcfg.data_path, tokenizer, mcfg.max_position_embeddings,
+                eos_id, rank, world_size, tcfg.seed, epoch, tcfg.max_tokens,
+            )
+            epoch_loader = DataLoader(stream_ds, batch_size=tcfg.batch_size,
+                                      num_workers=4, pin_memory=True)
+        else:
+            sampler.set_epoch(epoch)
+            epoch_loader = dataloader
+
         model.train()
         epoch_loss = 0.0
         epoch_tokens = 0
         num_steps_this_epoch = 0
+        micro_step = 0
         t0 = time.time()
 
-        for micro_step, (inputs, targets) in enumerate(dataloader):
+        for inputs, targets in epoch_loader:
             inputs = inputs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
-            with open_no_sync(model, micro_step, tcfg.gradient_accumulation_steps, world_size):
-                with torch.amp.autocast("cuda", dtype=pt_dtype):
-                    logits = model(inputs)
-                    loss = F.cross_entropy(logits.view(-1, mcfg.vocab_size), targets.view(-1))
-                    loss = loss / tcfg.gradient_accumulation_steps
+            with torch.amp.autocast("cuda", dtype=pt_dtype):
+                logits, aux_loss = model(inputs)
+                ce_loss = F.cross_entropy(logits.view(-1, mcfg.vocab_size), targets.view(-1))
+                loss = (ce_loss + aux_loss) / tcfg.gradient_accumulation_steps
 
-                scaler.scale(loss).backward()
+            loss.backward()
+            micro_step += 1
 
-            if (micro_step + 1) % tcfg.gradient_accumulation_steps == 0:
-                scaler.unscale_(optimizer)
+            if micro_step % tcfg.gradient_accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), tcfg.max_grad_norm)
 
                 lr = get_lr(global_step, total_steps, warmup_steps, tcfg.learning_rate)
                 for pg in optimizer.param_groups:
                     pg["lr"] = lr
 
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
                 step_loss = loss.item() * tcfg.gradient_accumulation_steps
@@ -567,54 +701,42 @@ def train(config_path: str):
                     elapsed = time.time() - t0
                     tok_per_sec = epoch_tokens / elapsed
                     ppl = math.exp(min(step_loss, 20.0))
+                    mfu = (tok_per_sec * 6 * param_info["active_per_token"]) / (world_size * 989e12) * 100
                     print(f"  step {global_step:>6d}/{total_steps} | "
                           f"loss {step_loss:.4f} | ppl {ppl:.2f} | "
-                          f"lr {lr:.2e} | {tok_per_sec:.0f} tok/s")
+                          f"lr {lr:.2e} | {tok_per_sec:.0f} tok/s | MFU {mfu:.1f}%")
                     if use_wandb:
                         import wandb
                         wandb.log({
                             "train/loss": step_loss,
+                            "train/ce_loss": ce_loss.item(),
                             "train/perplexity": ppl,
                             "train/lr": lr,
                             "train/tokens_per_sec": tok_per_sec,
+                            "train/mfu": mfu,
                             "train/global_step": global_step,
-                            "train/epoch": epoch + (micro_step + 1) / len(dataloader),
+                            "train/epoch": epoch + micro_step / max(steps_per_epoch * tcfg.gradient_accumulation_steps, 1),
                         }, step=global_step)
+
+                if tcfg.save_interval_steps > 0 and global_step % tcfg.save_interval_steps == 0 and rank == 0:
+                    _save_checkpoint(model, optimizer, mcfg, tcfg, experiment_id,
+                                     epoch + 1, global_step, step_loss, output_dir,
+                                     f"step_{global_step}.pt")
 
         avg_loss = epoch_loss / max(num_steps_this_epoch, 1)
         avg_ppl = math.exp(min(avg_loss, 20.0))
         print0(f"Epoch {epoch+1}/{tcfg.num_epochs} -- avg loss {avg_loss:.4f}, ppl {avg_ppl:.2f}", rank)
 
-        # Checkpointing (rank 0 only)
         if rank == 0 and (epoch + 1) % tcfg.save_interval_epochs == 0:
-            raw = unwrap_model(model)
-            ckpt_path = output_dir / f"epoch_{epoch+1}.pt"
-            torch.save({
-                "experiment_id": experiment_id,
-                "epoch": epoch + 1,
-                "global_step": global_step,
-                "model_state_dict": raw.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "model_config": asdict(mcfg),
-                "train_config": asdict(tcfg),
-                "loss": avg_loss,
-            }, ckpt_path)
-            print(f"  Saved checkpoint -> {ckpt_path}")
+            _save_checkpoint(model, optimizer, mcfg, tcfg, experiment_id,
+                             epoch + 1, global_step, avg_loss, output_dir,
+                             f"epoch_{epoch+1}.pt")
 
         if avg_loss < best_loss and rank == 0:
             best_loss = avg_loss
-            raw = unwrap_model(model)
-            best_path = output_dir / "best.pt"
-            torch.save({
-                "experiment_id": experiment_id,
-                "epoch": epoch + 1,
-                "global_step": global_step,
-                "model_state_dict": raw.state_dict(),
-                "model_config": asdict(mcfg),
-                "train_config": asdict(tcfg),
-                "loss": avg_loss,
-            }, best_path)
-            print(f"  New best model -> {best_path} (loss {best_loss:.4f})")
+            _save_checkpoint(model, None, mcfg, tcfg, experiment_id,
+                             epoch + 1, global_step, avg_loss, output_dir, "best.pt")
+            print(f"  New best model (loss {best_loss:.4f})")
 
         if world_size > 1:
             dist.barrier()
@@ -627,13 +749,27 @@ def train(config_path: str):
     cleanup_distributed()
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+def _save_checkpoint(model, optimizer, mcfg, tcfg, experiment_id,
+                     epoch, global_step, loss, output_dir, filename):
+    raw = unwrap_model(model)
+    ckpt = {
+        "experiment_id": experiment_id,
+        "epoch": epoch,
+        "global_step": global_step,
+        "model_state_dict": raw.state_dict(),
+        "model_config": asdict(mcfg),
+        "train_config": asdict(tcfg),
+        "loss": loss,
+    }
+    if optimizer is not None:
+        ckpt["optimizer_state_dict"] = optimizer.state_dict()
+    path = Path(output_dir) / filename
+    torch.save(ckpt, path)
+    print(f"  Saved checkpoint -> {path}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Config-driven pre-training")
-    parser.add_argument("--config", type=str, required=True,
-                        help="Path to YAML config file (e.g. configs/scaled_38M.yaml)")
+    parser.add_argument("--config", type=str, required=True)
     args = parser.parse_args()
     train(args.config)

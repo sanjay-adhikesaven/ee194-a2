@@ -1,0 +1,17 @@
+{
+  "1. DDP + compile": {
+    "error": "CUDA out of memory. Tried to allocate 256.00 MiB. GPU 0 has a total capacity of 79.10 GiB of which 45.88 MiB is free. Including non-PyTorch memory, this process has 79.04 GiB memory in use. Of the all"
+  },
+  "2. DDP + compile + liger": {
+    "error": "CUDA out of memory. Tried to allocate 256.00 MiB. GPU 0 has a total capacity of 79.10 GiB of which 103.88 MiB is free. Including non-PyTorch memory, this process has 78.99 GiB memory in use. Of the al"
+  },
+  "3. FSDP2 + compile": {
+    "error": "CUDA out of memory. Tried to allocate 4.00 GiB. GPU 0 has a total capacity of 79.10 GiB of which 3.94 GiB is free. Including non-PyTorch memory, this process has 75.15 GiB memory in use. Of the alloca"
+  },
+  "4. FSDP2 + compile + liger": {
+    "error": "CUDA out of memory. Tried to allocate 4.00 GiB. GPU 0 has a total capacity of 79.10 GiB of which 2.96 GiB is free. Including non-PyTorch memory, this process has 76.12 GiB memory in use. Of the alloca"
+  },
+  "5. FSDP2 + TP(2) + compile + liger": {
+    "error": "Sharding propagation failed for Op(op=aten.stack.default, args_schema=[DTensorSpec(mesh=DeviceMesh((dp=4), device: 'cuda', stride: (2,)), placements=(_NormPartial(reduce_op='sum', norm_type=2.0),), te"
+  }
+}

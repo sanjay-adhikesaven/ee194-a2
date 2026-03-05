@@ -1,0 +1,45 @@
+# MoE 1.5B active — 8 experts, top-2 routing
+# ~1.5B active params per token, ~4.5B total params
+# Trained on 57B tokens (1 epoch)
+
+experiment_id: moe_1_5B_active
+
+model:
+  vocab_size: 16384
+  hidden_size: 1280
+  num_layers: 28
+  num_attention_heads: 16
+  num_kv_heads: 4
+  intermediate_size: 5120
+  max_position_embeddings: 2048
+  rms_norm_eps: 1.0e-5
+  rope_theta: 10000.0
+  initializer_range: 0.02
+  tie_word_embeddings: true
+  num_experts: 8
+  num_experts_per_tok: 2
+  moe_aux_loss_coeff: 0.01
+
+train:
+  data_path: /mnt/nvme_tmp/ee194-a2-work/mixture_raw_data_sharded_25m_main
+  output_dir: runs/moe_1_5B_active
+  tokenizer_dir: tokenizer_16k
+  batch_size: 2
+  gradient_accumulation_steps: 16
+  learning_rate: 2.0e-4
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-8
+  max_grad_norm: 1.0
+  warmup_fraction: 0.01
+  num_epochs: 1
+  dtype: bfloat16
+  compile_model: true
+  use_fsdp: true
+  log_interval: 100
+  save_interval_steps: 2000
+  save_interval_epochs: 1
+  wandb_project: ee194-a2-pretrain
+  wandb_run_name: moe_1_5B_active
+  seed: 42
