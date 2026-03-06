@@ -1,8 +1,6 @@
-# MoE 500M active — 8 experts, top-2 routing
-# ~500M active params per token, ~1.5B total params
-# Trained on 57B tokens (1 epoch)
+# Full-size scaling: Raw data, MoE 390M active / 1.4B total, all ~36.5B tokens
 
-experiment_id: moe_500M_active
+experiment_id: full_raw_moe
 
 model:
   vocab_size: 16384
@@ -22,10 +20,11 @@ model:
 
 train:
   data_path: /mnt/nvme_tmp/ee194-a2-work/mixture_raw_data_sharded_25m_main
-  output_dir: runs/moe_500M_active
+  output_dir: runs/full_raw_moe
   tokenizer_dir: tokenizer_16k
-  batch_size: 8
-  gradient_accumulation_steps: 4
+  batch_size: 16
+  gradient_accumulation_steps: 1
+  max_tokens: 0
   learning_rate: 3.0e-4
   weight_decay: 0.1
   adam_beta1: 0.9
@@ -41,5 +40,5 @@ train:
   save_interval_steps: 5000
   save_interval_epochs: 1
   wandb_project: ee194-a2-pretrain
-  wandb_run_name: moe_500M_active
+  wandb_run_name: full_raw_moe
   seed: 42

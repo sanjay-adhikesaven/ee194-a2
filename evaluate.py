@@ -28,6 +28,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+import torch.distributed.tensor  # needed to load FSDP2/DTensor checkpoints
 from lm_eval import simple_evaluate
 from lm_eval.api.model import LM
 from lm_eval.api.instance import Instance
@@ -54,14 +55,29 @@ class NemotronNanoEvalLM(LM):
         super().__init__()
 
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        mcfg = ModelConfig(**ckpt["model_config"])
+
+        # FSDP2 saves DTensors — extract the local tensor data
+        state_dict = {}
+        for k, v in ckpt["model_state_dict"].items():
+            if hasattr(v, '_local_tensor'):
+                state_dict[k] = v._local_tensor
+            elif hasattr(v, 'to_local'):
+                try:
+                    state_dict[k] = v.to_local()
+                except Exception:
+                    state_dict[k] = v
+            else:
+                state_dict[k] = v
+
+        mcfg = ModelConfig(**{k: v for k, v in ckpt["model_config"].items()
+                              if k in ModelConfig.__dataclass_fields__})
 
         self.num_gpus = torch.cuda.device_count()
         self.models = []
         for gpu_id in range(self.num_gpus):
             device = torch.device(f"cuda:{gpu_id}")
             model = NemotronNano(mcfg)
-            model.load_state_dict(ckpt["model_state_dict"])
+            model.load_state_dict(state_dict)
             model = model.to(device).eval()
             self.models.append(model)
 

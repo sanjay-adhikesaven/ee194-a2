@@ -1,8 +1,7 @@
-# Dense 500M — Nemotron-Nano-V3 style, FSDP2 + compile
-# ~500M params, trained on 57B tokens (1 epoch)
-# Chinchilla ratio: ~114 tok/param (over-trained)
+# Equal-size data quality ablation: Curated data, Dense 382M, 1.3B tokens
+# Part of controlled comparison holding model + token count constant
 
-experiment_id: dense_500M
+experiment_id: equal_curated_dense
 
 model:
   vocab_size: 16384
@@ -19,11 +18,12 @@ model:
   num_experts: 0
 
 train:
-  data_path: /mnt/nvme_tmp/ee194-a2-work/mixture_raw_data_sharded_25m_main
-  output_dir: runs/dense_500M
+  data_path: /mnt/nvme_tmp/ee194-a2-work/partb_mixture_quality_filtered_data
+  output_dir: runs/equal_curated_dense
   tokenizer_dir: tokenizer_16k
   batch_size: 8
   gradient_accumulation_steps: 4
+  max_tokens: 1300000000
   learning_rate: 3.0e-4
   weight_decay: 0.1
   adam_beta1: 0.9
@@ -39,5 +39,5 @@ train:
   save_interval_steps: 5000
   save_interval_epochs: 1
   wandb_project: ee194-a2-pretrain
-  wandb_run_name: dense_500M
+  wandb_run_name: equal_curated_dense
   seed: 42

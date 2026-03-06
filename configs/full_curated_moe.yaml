@@ -1,30 +1,31 @@
-# Dense 1.5B — Nemotron-Nano-V3 style, FSDP2 + compile
-# ~1.5B params, trained on 57B tokens (1 epoch)
-# Chinchilla ratio: ~38 tok/param (near-optimal)
+# Full-size scaling: Curated data, MoE 390M active / 1.4B total, all ~5.3B tokens
 
-experiment_id: dense_1_5B
+experiment_id: full_curated_moe
 
 model:
   vocab_size: 16384
-  hidden_size: 2048
+  hidden_size: 768
   num_layers: 24
-  num_attention_heads: 16
+  num_attention_heads: 12
   num_kv_heads: 4
-  intermediate_size: 8192
+  intermediate_size: 3072
   max_position_embeddings: 2048
   rms_norm_eps: 1.0e-5
   rope_theta: 10000.0
   initializer_range: 0.02
   tie_word_embeddings: true
-  num_experts: 0
+  num_experts: 8
+  num_experts_per_tok: 2
+  moe_aux_loss_coeff: 0.01
 
 train:
-  data_path: /mnt/nvme_tmp/ee194-a2-work/mixture_raw_data_sharded_25m_main
-  output_dir: runs/dense_1_5B
+  data_path: /mnt/nvme_tmp/ee194-a2-work/partb_mixture_quality_filtered_data
+  output_dir: runs/full_curated_moe
   tokenizer_dir: tokenizer_16k
-  batch_size: 4
-  gradient_accumulation_steps: 8
-  learning_rate: 2.0e-4
+  batch_size: 16
+  gradient_accumulation_steps: 1
+  max_tokens: 0
+  learning_rate: 3.0e-4
   weight_decay: 0.1
   adam_beta1: 0.9
   adam_beta2: 0.95
@@ -36,8 +37,8 @@ train:
   compile_model: true
   use_fsdp: true
   log_interval: 100
-  save_interval_steps: 2000
+  save_interval_steps: 5000
   save_interval_epochs: 1
   wandb_project: ee194-a2-pretrain
-  wandb_run_name: dense_1_5B
+  wandb_run_name: full_curated_moe
   seed: 42

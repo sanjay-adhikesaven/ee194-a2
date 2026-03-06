@@ -483,7 +483,7 @@ def unwrap_model(model):
 # ---------------------------------------------------------------------------
 
 def estimate_tokens_from_manifest(data_path: str):
-    """Try to read _manifest.json to estimate total tokens."""
+    """Estimate total tokens from manifest or file size."""
     p = Path(data_path)
     if p.is_dir():
         manifest = p / "_manifest.json"
@@ -491,7 +491,13 @@ def estimate_tokens_from_manifest(data_path: str):
             with open(manifest) as f:
                 m = json.load(f)
             total_rows = m.get("total_rows", 0)
-            return total_rows * 2300  # ~2300 tokens/doc average for this corpus
+            return total_rows * 2300
+        # Fallback: estimate from total file size (~0.165 tokens per byte for JSONL)
+        total_bytes = sum(f.stat().st_size for f in p.glob("*.jsonl"))
+        if total_bytes > 0:
+            return int(total_bytes * 0.165)
+    elif p.is_file():
+        return int(p.stat().st_size * 0.165)
     return 0
 
 
@@ -718,25 +724,30 @@ def train(config_path: str):
                             "train/epoch": epoch + micro_step / max(steps_per_epoch * tcfg.gradient_accumulation_steps, 1),
                         }, step=global_step)
 
-                if tcfg.save_interval_steps > 0 and global_step % tcfg.save_interval_steps == 0 and rank == 0:
-                    _save_checkpoint(model, optimizer, mcfg, tcfg, experiment_id,
-                                     epoch + 1, global_step, step_loss, output_dir,
-                                     f"step_{global_step}.pt")
+                if tcfg.save_interval_steps > 0 and global_step % tcfg.save_interval_steps == 0:
+                    _gather_and_save_checkpoint(
+                        model, optimizer, mcfg, tcfg, experiment_id,
+                        epoch + 1, global_step, step_loss, output_dir,
+                        f"step_{global_step}.pt", rank, tcfg.use_fsdp and world_size > 1)
 
         avg_loss = epoch_loss / max(num_steps_this_epoch, 1)
         avg_ppl = math.exp(min(avg_loss, 20.0))
         print0(f"Epoch {epoch+1}/{tcfg.num_epochs} -- avg loss {avg_loss:.4f}, ppl {avg_ppl:.2f}", rank)
 
-        if rank == 0 and (epoch + 1) % tcfg.save_interval_epochs == 0:
-            _save_checkpoint(model, optimizer, mcfg, tcfg, experiment_id,
-                             epoch + 1, global_step, avg_loss, output_dir,
-                             f"epoch_{epoch+1}.pt")
+        if (epoch + 1) % tcfg.save_interval_epochs == 0:
+            _gather_and_save_checkpoint(
+                model, optimizer, mcfg, tcfg, experiment_id,
+                epoch + 1, global_step, avg_loss, output_dir,
+                f"epoch_{epoch+1}.pt", rank, tcfg.use_fsdp and world_size > 1)
 
-        if avg_loss < best_loss and rank == 0:
+        if avg_loss < best_loss:
             best_loss = avg_loss
-            _save_checkpoint(model, None, mcfg, tcfg, experiment_id,
-                             epoch + 1, global_step, avg_loss, output_dir, "best.pt")
-            print(f"  New best model (loss {best_loss:.4f})")
+            _gather_and_save_checkpoint(
+                model, None, mcfg, tcfg, experiment_id,
+                epoch + 1, global_step, avg_loss, output_dir,
+                "best.pt", rank, tcfg.use_fsdp and world_size > 1)
+            if rank == 0:
+                print(f"  New best model (loss {best_loss:.4f})")
 
         if world_size > 1:
             dist.barrier()
@@ -749,23 +760,32 @@ def train(config_path: str):
     cleanup_distributed()
 
 
-def _save_checkpoint(model, optimizer, mcfg, tcfg, experiment_id,
-                     epoch, global_step, loss, output_dir, filename):
-    raw = unwrap_model(model)
-    ckpt = {
-        "experiment_id": experiment_id,
-        "epoch": epoch,
-        "global_step": global_step,
-        "model_state_dict": raw.state_dict(),
-        "model_config": asdict(mcfg),
-        "train_config": asdict(tcfg),
-        "loss": loss,
-    }
-    if optimizer is not None:
-        ckpt["optimizer_state_dict"] = optimizer.state_dict()
-    path = Path(output_dir) / filename
-    torch.save(ckpt, path)
-    print(f"  Saved checkpoint -> {path}")
+def _gather_and_save_checkpoint(model, optimizer, mcfg, tcfg, experiment_id,
+                                epoch, global_step, loss, output_dir, filename,
+                                rank, use_fsdp):
+    """Gather full state dict across all FSDP ranks and save on rank 0."""
+    if use_fsdp:
+        from torch.distributed.checkpoint.state_dict import (
+            get_model_state_dict, StateDictOptions)
+        cpu_sd = get_model_state_dict(
+            model, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
+    else:
+        raw = unwrap_model(model)
+        cpu_sd = {k: v.cpu() for k, v in raw.state_dict().items()}
+
+    if rank == 0:
+        ckpt = {
+            "experiment_id": experiment_id,
+            "epoch": epoch,
+            "global_step": global_step,
+            "model_state_dict": cpu_sd,
+            "model_config": asdict(mcfg),
+            "train_config": asdict(tcfg),
+            "loss": loss,
+        }
+        path = Path(output_dir) / filename
+        torch.save(ckpt, path)
+        print(f"  Saved checkpoint -> {path}")
 
 
 if __name__ == "__main__":
