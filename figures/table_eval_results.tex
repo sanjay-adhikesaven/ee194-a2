@@ -1,0 +1,19 @@
+\begin{table}[ht]
+\centering
+\caption{Evaluation results for data quality ablation experiments.}
+\label{tab:eval_results}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrrrrrr}
+\toprule
+Experiment & HellaSwag & PIQA & WinoGrande & BoolQ & ARC-Easy & ARC-Challenge & SciQ & WikiText PPL & LAMBADA PPL \\
+\midrule
+Raw (1.3B tok, Dense) & 29.3 & 60.2 & 51.0 & 61.5 & 40.8 & 24.2 & 59.6 & 45.8 & 118.1 \\
+Curated (1.3B tok, Dense) & 31.0 & 61.9 & 50.8 & 61.3 & 47.6 & 25.4 & 65.3 & 46.1 & 178.9 \\
+Hybrid (1.3B tok, Dense) & 28.1 & 59.0 & 50.7 & 60.3 & 43.1 & 24.7 & 59.4 & 69.9 & 760.3 \\
+Raw (Full, Dense 382M) & 43.0 & 68.0 & 51.8 & 60.0 & 55.2 & 29.2 & 76.4 & 20.9 & 21.2 \\
+Curated (Full, Dense 382M) & 33.5 & 62.3 & 50.5 & 61.3 & 49.9 & 27.2 & 69.6 & 36.4 & 95.8 \\
+Raw (Full, MoE 390M/1.4B) & 49.1 & 70.2 & 54.5 & 60.7 & 59.6 & 32.1 & 79.6 & 17.6 & 15.2 \\
+Curated (Full, MoE 390M/1.4B) & 36.5 & 64.6 & 49.6 & 59.6 & 52.1 & 28.9 & 68.9 & 30.5 & 59.9 \\
+\bottomrule
+\end{tabular}}
+\end{table}

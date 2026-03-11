@@ -83,13 +83,14 @@ class TrainConfig:
     use_fsdp: bool = True
 
     log_interval: int = 50
-    save_interval_steps: int = 0
+    save_interval_steps: int = 5000
     save_interval_epochs: int = 1
     wandb_project: str = "ee194-a2-pretrain"
     wandb_run_name: str = ""
     seed: int = 42
 
     max_tokens: int = 0  # 0 = use all data; >0 = stop after this many tokens
+    resume_from: str = ""  # path to checkpoint to resume training from
 
 
 def load_config(config_path: str) -> tuple[str, ModelConfig, TrainConfig]:
@@ -598,6 +599,20 @@ def train(config_path: str):
               f"{param_info['active_per_token']:,} active/token "
               f"({param_info['embedding']:,} embed + {param_info['non_embedding']:,} non-embed)")
 
+    # ---- Resume from checkpoint (before FSDP/compile wrapping) ----
+    resume_step = 0
+    resume_epoch = 0
+    best_loss = float("inf")
+    if tcfg.resume_from and os.path.isfile(tcfg.resume_from):
+        print0(f"Resuming from checkpoint: {tcfg.resume_from}", rank)
+        ckpt = torch.load(tcfg.resume_from, map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        resume_step = ckpt.get("global_step", 0)
+        resume_epoch = ckpt.get("epoch", 0)
+        best_loss = ckpt.get("loss", float("inf"))
+        del ckpt
+        print0(f"  Resumed at step {resume_step}, epoch {resume_epoch}, loss {best_loss:.4f}", rank)
+
     # ---- Parallelism ----
     if tcfg.use_fsdp and world_size > 1:
         from torch.distributed.fsdp import fully_shard
@@ -653,8 +668,9 @@ def train(config_path: str):
         shutil.copy2(config_path, output_dir / "config.yaml")
 
     # ---- Training ----
-    global_step = 0
-    best_loss = float("inf")
+    global_step = resume_step
+
+    skip_micro_steps = resume_step * tcfg.gradient_accumulation_steps if resume_step > 0 else 0
 
     for epoch in range(tcfg.num_epochs):
         if use_streaming:
@@ -675,7 +691,49 @@ def train(config_path: str):
         micro_step = 0
         t0 = time.time()
 
-        for inputs, targets in epoch_loader:
+        # Use an iterator so we can detect exhaustion and keep all ranks in sync.
+        # FSDP forward/backward are collective ops, so every rank must execute
+        # the same number of forward passes to avoid NCCL deadlocks.
+        data_iter = iter(epoch_loader)
+        data_exhausted = False
+
+        while True:
+            # Each rank tries to get a batch
+            try:
+                if data_exhausted:
+                    raise StopIteration
+                inputs, targets = next(data_iter)
+                has_data = torch.ones(1, device=device, dtype=torch.int32)
+            except StopIteration:
+                has_data = torch.zeros(1, device=device, dtype=torch.int32)
+                # Create dummy batch so we can still participate in the
+                # collective forward/backward if other ranks still have data
+                inputs = torch.zeros(tcfg.batch_size, mcfg.max_position_embeddings - 1,
+                                     device=device, dtype=torch.long)
+                targets = torch.zeros_like(inputs)
+
+            # All-reduce to check if ANY rank still has data
+            if world_size > 1:
+                global_has_data = has_data.clone()
+                dist.all_reduce(global_has_data, op=dist.ReduceOp.SUM)
+                anyone_has_data = global_has_data.item() > 0
+            else:
+                anyone_has_data = has_data.item() > 0
+
+            if not anyone_has_data:
+                break
+
+            if has_data.item() == 0:
+                data_exhausted = True
+
+            # Fast-forward past already-trained steps when resuming
+            if skip_micro_steps > 0:
+                skip_micro_steps -= 1
+                micro_step += 1
+                if micro_step % tcfg.gradient_accumulation_steps == 0 and rank == 0 and (micro_step // tcfg.gradient_accumulation_steps) % 5000 == 0:
+                    print(f"  Skipping (resume): {micro_step // tcfg.gradient_accumulation_steps} steps fast-forwarded...")
+                continue
+
             inputs = inputs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
@@ -684,7 +742,13 @@ def train(config_path: str):
                 ce_loss = F.cross_entropy(logits.view(-1, mcfg.vocab_size), targets.view(-1))
                 loss = (ce_loss + aux_loss) / tcfg.gradient_accumulation_steps
 
-            loss.backward()
+            # Skip gradient update for dummy batches
+            if has_data.item() > 0:
+                loss.backward()
+            else:
+                loss.backward()
+                optimizer.zero_grad(set_to_none=True)
+
             micro_step += 1
 
             if micro_step % tcfg.gradient_accumulation_steps == 0:
@@ -728,17 +792,11 @@ def train(config_path: str):
                     _gather_and_save_checkpoint(
                         model, optimizer, mcfg, tcfg, experiment_id,
                         epoch + 1, global_step, step_loss, output_dir,
-                        f"step_{global_step}.pt", rank, tcfg.use_fsdp and world_size > 1)
+                        "latest.pt", rank, tcfg.use_fsdp and world_size > 1)
 
         avg_loss = epoch_loss / max(num_steps_this_epoch, 1)
         avg_ppl = math.exp(min(avg_loss, 20.0))
         print0(f"Epoch {epoch+1}/{tcfg.num_epochs} -- avg loss {avg_loss:.4f}, ppl {avg_ppl:.2f}", rank)
-
-        if (epoch + 1) % tcfg.save_interval_epochs == 0:
-            _gather_and_save_checkpoint(
-                model, optimizer, mcfg, tcfg, experiment_id,
-                epoch + 1, global_step, avg_loss, output_dir,
-                f"epoch_{epoch+1}.pt", rank, tcfg.use_fsdp and world_size > 1)
 
         if avg_loss < best_loss:
             best_loss = avg_loss
@@ -784,8 +842,14 @@ def _gather_and_save_checkpoint(model, optimizer, mcfg, tcfg, experiment_id,
             "loss": loss,
         }
         path = Path(output_dir) / filename
-        torch.save(ckpt, path)
-        print(f"  Saved checkpoint -> {path}")
+        tmp_path = path.with_suffix(".pt.tmp")
+        try:
+            torch.save(ckpt, tmp_path)
+            tmp_path.rename(path)
+            print(f"  Saved checkpoint -> {path}")
+        except Exception as e:
+            print(f"  WARNING: Checkpoint save failed ({e}), removing partial file")
+            tmp_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

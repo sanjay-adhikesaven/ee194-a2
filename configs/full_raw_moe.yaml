@@ -42,3 +42,4 @@ train:
   wandb_project: ee194-a2-pretrain
   wandb_run_name: full_raw_moe
   seed: 42
+  resume_from: ""
