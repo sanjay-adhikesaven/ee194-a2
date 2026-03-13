@@ -1,0 +1,125 @@
+{
+  "experiment_id": "full_hybrid_dense",
+  "timestamp": "2026-03-11T23:09:32.609556+00:00",
+  "description": "Data ablation: full_hybrid_dense",
+  "config_path": "configs/full_hybrid_dense.yaml",
+  "data": {
+    "path": "/home/sanjay/ee194-a2/data/hybrid_sharded"
+  },
+  "tokenizer": {
+    "type": "byte-level BPE (HuggingFace tokenizers)",
+    "vocab_size": 16384,
+    "trained_on": "hybrid pre-training corpus",
+    "dir": "tokenizer_16k"
+  },
+  "model": {
+    "family": "Nemotron-Nano-V3 (dense, scaled down)",
+    "vocab_size": 16384,
+    "hidden_size": 1024,
+    "num_layers": 24,
+    "num_attention_heads": 16,
+    "num_kv_heads": 4,
+    "intermediate_size": 4096,
+    "max_position_embeddings": 2048,
+    "rms_norm_eps": 1e-05,
+    "rope_theta": 10000.0,
+    "initializer_range": 0.02,
+    "tie_word_embeddings": true,
+    "num_experts": 0,
+    "total_params": 381731840,
+    "active_params_per_token": 381731840,
+    "embedding_params": 16777216,
+    "non_embedding_params": 364954624
+  },
+  "training": {
+    "epochs": 1,
+    "batch_size_per_gpu": 16,
+    "gradient_accumulation_steps": 2,
+    "num_gpus": 8,
+    "global_batch_size": 256,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.1,
+    "warmup_fraction": 0.01,
+    "dtype": "bfloat16",
+    "optimizer": "AdamW (beta1=0.9, beta2=0.95)",
+    "schedule": "linear warmup + cosine decay",
+    "best_train_loss": 2.469850540161133,
+    "best_epoch": 1,
+    "total_steps": 10000
+  },
+  "eval_results": {
+    "hellaswag_acc_norm": 0.3466440948018323,
+    "piqa_acc": 0.6371055495103374,
+    "winogrande_acc": 0.494869771112865,
+    "boolq_acc": 0.6131498470948012,
+    "arc_easy_acc_norm": 0.5311447811447811,
+    "arc_challenge_acc_norm": 0.2901023890784983,
+    "sciq_acc_norm": 0.704,
+    "wikitext_word_ppl": 35.878266571895836,
+    "wikitext_bits_per_byte": 0.9658879778001401,
+    "lambada_ppl": 85.07450702162214
+  },
+  "eval_results_full": {
+    "arc_challenge": {
+      "alias": "arc_challenge",
+      "acc,none": 0.25597269624573377,
+      "acc_stderr,none": 0.01275301324124452,
+      "acc_norm,none": 0.2901023890784983,
+      "acc_norm_stderr,none": 0.013261573677520767
+    },
+    "arc_easy": {
+      "alias": "arc_easy",
+      "acc,none": 0.5900673400673401,
+      "acc_stderr,none": 0.010091953527506236,
+      "acc_norm,none": 0.5311447811447811,
+      "acc_norm_stderr,none": 0.01023986025002175
+    },
+    "boolq": {
+      "alias": "boolq",
+      "acc,none": 0.6131498470948012,
+      "acc_stderr,none": 0.008518188340844744
+    },
+    "hellaswag": {
+      "alias": "hellaswag",
+      "acc,none": 0.3067118103963354,
+      "acc_stderr,none": 0.0046018628072402095,
+      "acc_norm,none": 0.3466440948018323,
+      "acc_norm_stderr,none": 0.00474928607155957
+    },
+    "lambada_openai": {
+      "alias": "lambada_openai",
+      "perplexity,none": 85.07450702162214,
+      "perplexity_stderr,none": 3.65051064190366,
+      "acc,none": 1.0,
+      "acc_stderr,none": 0.0
+    },
+    "piqa": {
+      "alias": "piqa",
+      "acc,none": 0.6371055495103374,
+      "acc_stderr,none": 0.01121866757084088,
+      "acc_norm,none": 0.6284004352557128,
+      "acc_norm_stderr,none": 0.01127460300672475
+    },
+    "sciq": {
+      "alias": "sciq",
+      "acc,none": 0.805,
+      "acc_stderr,none": 0.012535235623319317,
+      "acc_norm,none": 0.704,
+      "acc_norm_stderr,none": 0.014442734941575022
+    },
+    "wikitext": {
+      "alias": "wikitext",
+      "word_perplexity,none": 35.878266571895836,
+      "word_perplexity_stderr,none": "N/A",
+      "byte_perplexity,none": 1.953265385135403,
+      "byte_perplexity_stderr,none": "N/A",
+      "bits_per_byte,none": 0.9658879778001401,
+      "bits_per_byte_stderr,none": "N/A"
+    },
+    "winogrande": {
+      "alias": "winogrande",
+      "acc,none": 0.494869771112865,
+      "acc_stderr,none": 0.014051745961790516
+    }
+  }
+}

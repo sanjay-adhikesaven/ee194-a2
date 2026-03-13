@@ -400,7 +400,9 @@ class StreamingPretrainDataset(IterableDataset):
                         total_tokens_yielded += self.seq_len
                         yield t[:-1], t[1:]
 
-                        if self.max_tokens > 0 and total_tokens_yielded >= self.max_tokens // self.world_size:
+                        worker_info = torch.utils.data.get_worker_info()
+                        num_workers = worker_info.num_workers if worker_info else 1
+                        if self.max_tokens > 0 and total_tokens_yielded >= self.max_tokens // (self.world_size * num_workers):
                             return
 
 
@@ -491,6 +493,8 @@ def estimate_tokens_from_manifest(data_path: str):
         if manifest.exists():
             with open(manifest) as f:
                 m = json.load(f)
+            if "estimated_total_tokens" in m:
+                return m["estimated_total_tokens"]
             total_rows = m.get("total_rows", 0)
             return total_rows * 2300
         # Fallback: estimate from total file size (~0.165 tokens per byte for JSONL)
@@ -569,6 +573,9 @@ def train(config_path: str):
         print0("Tokenizing dataset (in-memory) ...", rank)
         all_ids = load_and_tokenize(tcfg.data_path, tokenizer,
                                     mcfg.max_position_embeddings, eos_id, rank)
+        if tcfg.max_tokens > 0 and len(all_ids) > tcfg.max_tokens:
+            print0(f"Truncating {len(all_ids):,} tokens to max_tokens={tcfg.max_tokens:,}", rank)
+            all_ids = all_ids[:tcfg.max_tokens]
         total_tokens = len(all_ids)
         print0(f"Total tokens: {total_tokens:,}", rank)
         dataset = PretrainDataset(all_ids, mcfg.max_position_embeddings)
@@ -721,6 +728,9 @@ def train(config_path: str):
                 anyone_has_data = has_data.item() > 0
 
             if not anyone_has_data:
+                break
+
+            if global_step >= total_steps:
                 break
 
             if has_data.item() == 0:

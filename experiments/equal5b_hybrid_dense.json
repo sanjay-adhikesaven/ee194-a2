@@ -1,0 +1,125 @@
+{
+  "experiment_id": "equal5b_hybrid_dense",
+  "timestamp": "2026-03-11T20:55:27.686155+00:00",
+  "description": "Data ablation: equal5b_hybrid_dense",
+  "config_path": "configs/equal5b_hybrid_dense.yaml",
+  "data": {
+    "path": "/home/sanjay/ee194-a2/data/hybrid_sharded"
+  },
+  "tokenizer": {
+    "type": "byte-level BPE (HuggingFace tokenizers)",
+    "vocab_size": 16384,
+    "trained_on": "hybrid pre-training corpus",
+    "dir": "tokenizer_16k"
+  },
+  "model": {
+    "family": "Nemotron-Nano-V3 (dense, scaled down)",
+    "vocab_size": 16384,
+    "hidden_size": 1024,
+    "num_layers": 24,
+    "num_attention_heads": 16,
+    "num_kv_heads": 4,
+    "intermediate_size": 4096,
+    "max_position_embeddings": 2048,
+    "rms_norm_eps": 1e-05,
+    "rope_theta": 10000.0,
+    "initializer_range": 0.02,
+    "tie_word_embeddings": true,
+    "num_experts": 0,
+    "total_params": 381731840,
+    "active_params_per_token": 381731840,
+    "embedding_params": 16777216,
+    "non_embedding_params": 364954624
+  },
+  "training": {
+    "epochs": 1,
+    "batch_size_per_gpu": 16,
+    "gradient_accumulation_steps": 2,
+    "num_gpus": 8,
+    "global_batch_size": 256,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.1,
+    "warmup_fraction": 0.01,
+    "dtype": "bfloat16",
+    "optimizer": "AdamW (beta1=0.9, beta2=0.95)",
+    "schedule": "linear warmup + cosine decay",
+    "best_train_loss": 2.8512811835342253,
+    "best_epoch": 1,
+    "total_steps": 10871
+  },
+  "eval_results": {
+    "hellaswag_acc_norm": 0.33260306711810395,
+    "piqa_acc": 0.6414581066376496,
+    "winogrande_acc": 0.4861878453038674,
+    "boolq_acc": 0.6214067278287462,
+    "arc_easy_acc_norm": 0.51010101010101,
+    "arc_challenge_acc_norm": 0.2977815699658703,
+    "sciq_acc_norm": 0.678,
+    "wikitext_word_ppl": 37.113430783247765,
+    "wikitext_bits_per_byte": 0.9750196527912098,
+    "lambada_ppl": 108.40484586889674
+  },
+  "eval_results_full": {
+    "arc_challenge": {
+      "alias": "arc_challenge",
+      "acc,none": 0.24744027303754265,
+      "acc_stderr,none": 0.012610352663292673,
+      "acc_norm,none": 0.2977815699658703,
+      "acc_norm_stderr,none": 0.01336308010724448
+    },
+    "arc_easy": {
+      "alias": "arc_easy",
+      "acc,none": 0.5614478114478114,
+      "acc_stderr,none": 0.01018201027547112,
+      "acc_norm,none": 0.51010101010101,
+      "acc_norm_stderr,none": 0.010257689687458372
+    },
+    "boolq": {
+      "alias": "boolq",
+      "acc,none": 0.6214067278287462,
+      "acc_stderr,none": 0.008483341718024479
+    },
+    "hellaswag": {
+      "alias": "hellaswag",
+      "acc,none": 0.29814777932682734,
+      "acc_stderr,none": 0.0045650984210852215,
+      "acc_norm,none": 0.33260306711810395,
+      "acc_norm_stderr,none": 0.004701828071992643
+    },
+    "lambada_openai": {
+      "alias": "lambada_openai",
+      "perplexity,none": 108.40484586889674,
+      "perplexity_stderr,none": 4.768548981725175,
+      "acc,none": 1.0,
+      "acc_stderr,none": 0.0
+    },
+    "piqa": {
+      "alias": "piqa",
+      "acc,none": 0.6414581066376496,
+      "acc_stderr,none": 0.01118921257235635,
+      "acc_norm,none": 0.6284004352557128,
+      "acc_norm_stderr,none": 0.011274603006724754
+    },
+    "sciq": {
+      "alias": "sciq",
+      "acc,none": 0.778,
+      "acc_stderr,none": 0.013148721948877364,
+      "acc_norm,none": 0.678,
+      "acc_norm_stderr,none": 0.01478291360099667
+    },
+    "wikitext": {
+      "alias": "wikitext",
+      "word_perplexity,none": 37.113430783247765,
+      "word_perplexity_stderr,none": "N/A",
+      "byte_perplexity,none": 1.9656679737813916,
+      "byte_perplexity_stderr,none": "N/A",
+      "bits_per_byte,none": 0.9750196527912098,
+      "bits_per_byte_stderr,none": "N/A"
+    },
+    "winogrande": {
+      "alias": "winogrande",
+      "acc,none": 0.4861878453038674,
+      "acc_stderr,none": 0.014047122916440419
+    }
+  }
+}
