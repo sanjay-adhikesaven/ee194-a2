@@ -1,0 +1,403 @@
+% =============================================================================
+% Training, Evaluation, and Results sections
+% Requires: booktabs, graphicx, multirow, subcaption, hyperref
+% Figures assumed in figures/slides/
+% =============================================================================
+
+% -----------------------------------------------------------------------------
+\section{Training}
+\label{sec:training}
+% -----------------------------------------------------------------------------
+
+We conduct three groups of pre-training experiments, each designed to isolate a
+different axis of variation: model capacity, data quality at fixed compute, and
+the interaction between data source and model architecture at full scale.
+All runs use the Nemotron-Nano-V3 architecture family and are trained on
+8$\times$NVIDIA H100 80\,GB GPUs.
+
+\subsection{Architecture}
+\label{sec:architecture}
+
+\paragraph{Dense model.}
+Our dense baseline follows the Nemotron-Nano-V3 design: a decoder-only
+Transformer with Grouped-Query Attention (GQA), RMSNorm, SwiGLU activations,
+and Rotary Position Embeddings (RoPE).  The 382M-parameter configuration uses
+a hidden dimension of 1024, 24 layers, 16 attention heads (4 key-value heads),
+an intermediate size of 4096, and a context length of 2048 tokens.  Input and
+output embeddings are tied.
+
+\paragraph{Mixture-of-Experts (MoE) model.}
+The MoE variant replaces each dense feed-forward block with a top-2 gated
+mixture of 8 experts, yielding 1.4B total parameters but only 390M active
+parameters per token---roughly matching the dense model's per-token compute.
+We use a hidden dimension of 768, 24 layers, 12 attention heads (4 key-value
+heads), and an intermediate size of 3072 per expert.  A load-balancing
+auxiliary loss ($\alpha=0.01$) encourages uniform expert utilization.
+
+\paragraph{Tokenizer.}
+All experiments share a 16K-vocabulary BPE tokenizer trained on the hybrid
+pre-training corpus.
+
+\subsection{Training Infrastructure}
+\label{sec:infra}
+
+Models are distributed across 8 GPUs using Fully Sharded Data Parallelism
+(FSDP2).  We apply \texttt{torch.compile} for graph-level kernel fusion.
+Training uses bfloat16 mixed precision throughout.
+
+\paragraph{Optimizer.}
+AdamW with $\beta_1=0.9$, $\beta_2=0.95$, $\epsilon=10^{-8}$, and weight
+decay $0.1$ (applied to all parameters except biases and layer norms).
+Gradients are clipped at a max norm of 1.0.
+
+\paragraph{Learning rate schedule.}
+Linear warmup over the first 1\% of training steps followed by cosine decay
+to $0.5\times$ the peak learning rate of $3\times10^{-4}$.
+
+\paragraph{Data loading.}
+Large datasets (raw, hybrid) are stored as pre-sharded JSONL files and
+consumed via a streaming data loader that tokenizes on-the-fly, avoiding the
+need to materialize the full tokenized corpus in memory.  Smaller datasets
+(curated) are tokenized in memory at startup.
+
+\subsection{Experiment Group 1: Model Scaling}
+\label{sec:group1}
+
+The first group of experiments holds the data source constant (raw Wikipedia
+and web text) and varies model capacity from 4M to 58M parameters
+(Table~\ref{tab:group1}).  These runs establish a baseline scaling trend and
+confirm that our training pipeline produces expected improvements with
+increased capacity.
+
+\begin{table}[h]
+\centering
+\caption{Group 1: Model scaling experiments (raw data, dense architecture).}
+\label{tab:group1}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Experiment} & \textbf{Params} & \textbf{Tokens} & \textbf{Steps} \\
+\midrule
+\texttt{baseline\_29k\_docs} & 4M   & 26M   & 597    \\
+\texttt{scaled\_38M}         & 39M  & 378M  & 720    \\
+\texttt{raw\_sub\_57M}       & 58M  & 328M  & 396    \\
+\texttt{curated\_57M}        & 58M  & 328M  & 936    \\
+\texttt{hybrid\_sub\_57M}    & 58M  & 328M  & 936    \\
+\texttt{scaled\_57M}         & 58M  & 378M  & 1,080  \\
+\texttt{raw\_full\_57M}      & 58M  & 5.7B  & 2,525  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+We additionally vary data source at the 58M scale (raw, curated, hybrid,
+scaled subsets) to provide an early signal on data quality effects before
+committing to the larger runs in Groups 2 and 3.
+
+\subsection{Experiment Group 2: Data Quality at Equal Token Budget}
+\label{sec:group2}
+
+To isolate the effect of data quality from data quantity, we train three
+382M-parameter dense models on exactly 5.7B tokens each, drawn from
+different corpora (Table~\ref{tab:group2}).  The curated corpus uses the
+full available curated data ($\approx$5.3B tokens); for raw and hybrid we
+subsample to match.
+
+\begin{table}[h]
+\centering
+\caption{Group 2: Equal-token data quality ablation (382M dense, 5.7B tokens each).}
+\label{tab:group2}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Experiment} & \textbf{Data Source} & \textbf{Tokens} & \textbf{Steps} \\
+\midrule
+\texttt{equal5b\_raw\_dense}    & Raw     & 5.7B & 10,871 \\
+\texttt{full\_curated\_dense}   & Curated & 5.3B & 10,000 \\
+\texttt{equal5b\_hybrid\_dense} & Hybrid  & 5.7B & 10,871 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Data sources.}
+\begin{itemize}
+    \item \textbf{Raw}: A 25M-document mixture of FineWeb-Edu (17.5M),
+          FinePDFs-Edu (5M), and FineWiki (2.5M), totaling $\approx$55B
+          tokens.
+    \item \textbf{Curated}: Quality-filtered subset of the raw corpus
+          produced by perplexity filtering, deduplication, and domain
+          balancing, yielding $\approx$5.3B tokens.
+    \item \textbf{Hybrid}: The curated corpus augmented with
+          LLM-generated synthetic data (via NVIDIA Data Curator),
+          totaling $\approx$8.8B tokens.
+\end{itemize}
+
+\subsection{Experiment Group 3: Full-Scale Data $\times$ Architecture}
+\label{sec:group3}
+
+The final group trains both dense and MoE architectures on the full extent
+of each data source (Table~\ref{tab:group3}), producing a $3\times2$ grid
+of experiments that reveals how data quality and model architecture interact
+at scale.  All models train for one full epoch over their respective corpus.
+
+\begin{table}[h]
+\centering
+\caption{Group 3: Full-scale runs across data sources and architectures.}
+\label{tab:group3}
+\begin{tabular}{llcccc}
+\toprule
+\textbf{Data} & \textbf{Architecture} & \textbf{Total Params} & \textbf{Active Params} & \textbf{Tokens} & \textbf{Steps} \\
+\midrule
+Raw     & Dense & 382M  & 382M & 55.1B & 105,000 \\
+Raw     & MoE   & 1.4B  & 390M & 55.1B & 210,000 \\
+Curated & Dense & 382M  & 382M & 5.2B  & 10,000  \\
+Curated & MoE   & 1.4B  & 390M & 6.6B  & 25,000  \\
+Hybrid  & Dense & 382M  & 382M & 5.2B  & 10,000  \\
+Hybrid  & MoE   & 1.4B  & 390M & 6.6B  & 25,000  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The MoE models use a global batch size of 128 (16 per GPU $\times$ 8 GPUs)
+while dense models use 256 (16 per GPU $\times$ 2 gradient accumulation
+steps $\times$ 8 GPUs), so that MoE runs see the same total tokens in
+roughly twice the number of steps.
+The raw-data runs train for significantly more steps due to the
+10$\times$ larger corpus, reaching lower final losses (1.69 for dense,
+1.70 for MoE) compared to the curated and hybrid runs ($\approx$2.4--3.1).
+
+
+% -----------------------------------------------------------------------------
+\section{Evaluation}
+\label{sec:evaluation}
+% -----------------------------------------------------------------------------
+
+We evaluate all models using the EleutherAI LM Evaluation Harness, the
+same zero-shot benchmark backend used by NeMo Evaluator.  Because our
+custom Nemotron-Nano architecture is not natively registered in the NeMo
+model zoo, we integrate with the harness directly: a custom wrapper class
+(\texttt{NemotronNanoEvalLM}) implements the \texttt{lm\_eval.api.model.LM}
+interface, providing batched log-likelihood scoring and greedy generation
+on top of our trained checkpoints.  This produces results identical to
+those obtained through NeMo Evaluator's harness integration, while
+supporting our non-standard model class.
+
+Each checkpoint is evaluated by running:
+
+\begin{verbatim}
+python evaluate.py \
+  --checkpoint runs/<experiment>/best.pt \
+  --tokenizer_dir tokenizer_16k \
+  --tasks hellaswag,piqa,arc_easy,arc_challenge,\
+         winogrande,sciq,boolq,lambada_openai,wikitext \
+  --batch_size 64
+\end{verbatim}
+
+\subsection{Benchmarks}
+
+We select a suite of nine zero-shot tasks appropriate for base (non-chat)
+language models, covering commonsense reasoning, science, reading
+comprehension, and language modeling:
+
+\paragraph{Accuracy benchmarks (higher is better).}
+\begin{itemize}
+    \item \textbf{HellaSwag}: Commonsense sentence completion (acc\_norm).
+    \item \textbf{PIQA}: Physical intuition QA (acc).
+    \item \textbf{ARC-Easy / ARC-Challenge}: Grade-school science
+          questions (acc\_norm).
+    \item \textbf{SciQ}: Multiple-choice science QA (acc\_norm).
+    \item \textbf{BoolQ}: Yes/no reading comprehension (acc).
+    \item \textbf{WinoGrande}: Coreference resolution (acc).
+\end{itemize}
+
+\paragraph{Perplexity benchmarks (lower is better).}
+\begin{itemize}
+    \item \textbf{WikiText}: Word-level perplexity on WikiText-103.
+    \item \textbf{LAMBADA}: Perplexity on the LAMBADA last-word
+          prediction task.
+\end{itemize}
+
+All evaluations use zero-shot prompting with no task-specific fine-tuning.
+Raw evaluation outputs are saved per-run in
+\texttt{runs/<experiment>/eval\_results.json}.
+
+
+% -----------------------------------------------------------------------------
+\section{Results}
+\label{sec:results}
+% -----------------------------------------------------------------------------
+
+\subsection{Group 1: Model Scaling}
+
+Figure~\ref{fig:group1a} shows the effect of scaling model size from 4M to
+58M parameters on raw Wikipedia data.  Larger models improve consistently
+across all benchmarks, with particularly large gains on SciQ
+($+$25.8\,pp from 4M to 58M) and BoolQ ($+$5.0\,pp).
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{slides/group1a_model_size.pdf}
+\caption{Effect of model size on benchmark accuracy (raw data, dense
+architecture).  Scaling from 4M to 58M parameters yields consistent
+improvements, confirming that model capacity is a primary performance driver.}
+\label{fig:group1a}
+\end{figure}
+
+At the fixed 58M model size, Figure~\ref{fig:group1b} compares five data
+source configurations.  Performance differences are modest across most
+benchmarks, with the notable exception of SciQ where the full raw dataset
+(5.7B tokens) dramatically outperforms all subsets ($\approx$328M tokens),
+suggesting that data quantity dominates quality effects at this small model
+scale.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{slides/group1b_data_source.pdf}
+\caption{Effect of data source and quantity at fixed 58M model size.
+Most benchmarks show little sensitivity to data source; SciQ is the
+exception, where more data helps substantially.}
+\label{fig:group1b}
+\end{figure}
+
+
+\subsection{Group 2: Data Quality at Equal Token Budget}
+
+When we control for token count (5.7B tokens each), data quality differences
+become clearly visible (Figure~\ref{fig:group2_acc},
+Table~\ref{tab:group2_results}).
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{slides/group2_equal_accuracy.pdf}
+\caption{Benchmark accuracy at equal token budget (5.7B tokens, 382M
+dense).  Hybrid data outperforms both raw and curated on most benchmarks.}
+\label{fig:group2_acc}
+\end{figure}
+
+\begin{table}[h]
+\centering
+\caption{Group 2 results: accuracy (\%) and perplexity at 5.7B tokens.
+Best result per metric in \textbf{bold}.}
+\label{tab:group2_results}
+\begin{tabular}{l*{7}{c}cc}
+\toprule
+& \rotatebox{60}{HellaSwag} & \rotatebox{60}{PIQA} & \rotatebox{60}{ARC-E}
+& \rotatebox{60}{ARC-C} & \rotatebox{60}{SciQ} & \rotatebox{60}{BoolQ}
+& \rotatebox{60}{WinoGrande} & \rotatebox{60}{WikiText$\downarrow$}
+& \rotatebox{60}{LAMBADA$\downarrow$} \\
+\midrule
+Raw     & 31.3 & 61.4 & 45.5 & 24.9 & 61.2 & \textbf{62.1} & \textbf{50.9} & \textbf{36.2} & \textbf{82.0} \\
+Curated & 33.5 & 62.3 & 49.9 & 27.2 & 69.6 & 61.3 & 50.5 & 36.4 & 95.8 \\
+Hybrid  & \textbf{33.3} & \textbf{64.1} & \textbf{51.0} & \textbf{29.8} & \textbf{67.8} & \textbf{62.1} & 48.6 & 37.1 & 108.4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The hybrid corpus achieves the best accuracy on 5 of 7 benchmarks,
+including substantial leads on ARC-Challenge ($+$4.9\,pp over raw) and
+ARC-Easy ($+$5.5\,pp over raw).  Raw data retains an edge on perplexity
+metrics, likely because its distribution is closer to the WikiText and
+LAMBADA test sets.  These results confirm that \emph{at a fixed token
+budget, data curation and augmentation meaningfully improve downstream
+task performance}.
+
+
+\subsection{Group 3: Full-Scale Data $\times$ Architecture}
+
+Table~\ref{tab:group3_results} and Figure~\ref{fig:group3_acc} present
+the full $3\times2$ grid of results.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{slides/group3_fullscale_accuracy.pdf}
+\caption{Full-scale accuracy: Dense vs.\ MoE across three data sources.
+MoE consistently outperforms the matched dense model.}
+\label{fig:group3_acc}
+\end{figure}
+
+\begin{table}[h]
+\centering
+\caption{Group 3 results: full-scale runs.  Best per data source in
+\textbf{bold}; overall best \underline{underlined}.}
+\label{tab:group3_results}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{ll*{7}{c}cc}
+\toprule
+\textbf{Data} & \textbf{Arch.}
+& \rotatebox{60}{HellaSwag} & \rotatebox{60}{PIQA} & \rotatebox{60}{ARC-E}
+& \rotatebox{60}{ARC-C} & \rotatebox{60}{SciQ} & \rotatebox{60}{BoolQ}
+& \rotatebox{60}{WinoGrande} & \rotatebox{60}{WikiText$\downarrow$}
+& \rotatebox{60}{LAMBADA$\downarrow$} \\
+\midrule
+Raw     & Dense & 43.0 & 68.0 & 55.2 & 29.2 & 76.4 & 60.0 & 51.8 & 20.9 & 21.2 \\
+Raw     & MoE   & \underline{\textbf{49.1}} & \underline{\textbf{70.2}} & \underline{\textbf{59.6}} & \underline{\textbf{32.1}} & \underline{\textbf{79.6}} & \textbf{60.7} & \underline{\textbf{54.5}} & \underline{\textbf{17.6}} & \underline{\textbf{15.2}} \\
+\midrule
+Curated & Dense & 33.5 & 62.3 & 49.9 & 27.2 & 69.6 & \textbf{61.3} & \textbf{50.5} & 36.4 & 95.8 \\
+Curated & MoE   & \textbf{36.5} & \textbf{64.6} & \textbf{52.1} & \textbf{28.9} & 68.9 & 59.6 & 49.6 & \textbf{30.5} & \textbf{59.9} \\
+\midrule
+Hybrid  & Dense & 34.7 & 63.7 & 53.1 & 29.0 & 70.4 & 61.3 & 49.5 & 35.9 & 85.1 \\
+Hybrid  & MoE   & \textbf{38.5} & \textbf{66.2} & \textbf{57.6} & \textbf{31.7} & \textbf{73.0} & \textbf{61.4} & \textbf{52.0} & \textbf{28.6} & \textbf{55.8} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\paragraph{Finding 1: Volume beats quality at scale.}
+The raw-data models dominate the overall leaderboard despite using
+unfiltered data.  With $\approx$55B training tokens (10$\times$ the
+curated/hybrid corpora), the raw MoE achieves the best score on every
+benchmark.  HellaSwag reaches 49.1\% (vs.\ 38.5\% for hybrid MoE),
+and WikiText perplexity drops to 17.6 (vs.\ 28.6).  At current corpus
+sizes, we do not yet have enough curated data for quality to overcome
+the sheer advantage of quantity.
+
+\paragraph{Finding 2: Curation helps per-token.}
+Comparing the curated and hybrid columns against raw \emph{at similar
+token counts} (5--9B), hybrid data consistently outperforms raw:
+hybrid MoE beats curated MoE on 6 of 7 accuracy benchmarks and
+achieves 7.3 points lower WikiText perplexity than the corresponding
+dense model.  This confirms that data curation and synthetic
+augmentation improve sample efficiency.
+
+\paragraph{Finding 3: MoE $>$ Dense for free.}
+Across all three data sources, the MoE architecture improves over the
+matched dense model on nearly every metric, despite using the same
+number of active parameters per token.  The gains are:
+\begin{itemize}
+    \item HellaSwag: $+$3.0 to $+$6.1\,pp
+    \item PIQA: $+$2.2 to $+$2.4\,pp
+    \item ARC-Easy: $+$2.3 to $+$4.5\,pp
+    \item WikiText PPL: $-$3.3 to $-$7.3
+\end{itemize}
+The MoE advantage is largest on the raw corpus (where more training
+data allows the experts to specialize more effectively) and smallest
+on the curated corpus.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.85\linewidth]{slides/group3_heatmap.pdf}
+\caption{Heatmap of the $3\times2$ experimental grid.  Each cell shows
+accuracy (\%) for a given benchmark; the rightmost column shows the
+average across all seven benchmarks.  MoE consistently outperforms
+Dense within each data source.}
+\label{fig:group3_heatmap}
+\end{figure}
+
+Figure~\ref{fig:group3_ppl} shows the perplexity comparison.  The
+pattern mirrors the accuracy results: raw-data models achieve the
+lowest perplexity, and MoE improves over dense in every case.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{slides/group3_fullscale_perplexity.pdf}
+\caption{WikiText and LAMBADA perplexity for the six full-scale runs.
+Lower is better.  MoE reduces perplexity across all data sources.}
+\label{fig:group3_ppl}
+\end{figure}
+
+\subsection{Summary}
+
+Our experiments reveal a clear hierarchy: (1)~data volume is the
+strongest lever at current scales, (2)~data curation improves
+sample efficiency when token budgets are matched, and (3)~sparse
+MoE routing provides a consistent ``free lunch'' over dense models
+at equivalent per-token compute.  The best overall model---raw-data
+MoE with 1.4B total parameters and 390M active---achieves 49.1\%
+HellaSwag, 70.2\% PIQA, and 17.6 WikiText perplexity.

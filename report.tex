@@ -1,7 +1,7 @@
 \documentclass[10pt]{article}
 
 % -----------------------------
-% Page/Layout (compressed, no content changes)
+% Page/Layout
 % -----------------------------
 \usepackage[margin=0.75in]{geometry}
 
@@ -9,7 +9,7 @@
 % Spacing compression
 % -----------------------------
 \usepackage{setspace}
-\setstretch{0.94}
+\setstretch{0.92}
 \setlength{\parskip}{1pt}
 \setlength{\parindent}{0pt}
 
@@ -50,11 +50,7 @@
 
 % Captions (tight)
 \usepackage{caption}
-\captionsetup{
-  font=small,
-  labelfont=bf,
-  skip=2pt
-}
+\captionsetup{font=small, labelfont=bf, skip=2pt}
 
 % -----------------------------
 % Number formatting
@@ -67,16 +63,7 @@
 % -----------------------------
 \usepackage{xurl}
 \usepackage{hyperref}
-\hypersetup{
-  colorlinks=true,
-  linkcolor=blue,
-  urlcolor=black,
-  citecolor=blue
-}
-
-\title{EE 290/194 Assignment 2 Report: Pre-training a Base Model from Scratch}
-\author{Group 5: Nazar Ospanov, Zoir Imomaliev, Jason Trinh, Sanjay Adhikesaven}
-\date{}
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=black, citecolor=blue}
 
 \begin{document}
 \begin{center}
@@ -86,66 +73,54 @@
 \end{center}
 \vspace{-10pt}
 
-\section{Architecture and scaling justification (Part B)}
+% =====================================================================
+\section{Architecture and Scaling Justification}
+% =====================================================================
 
 We train a decoder-only transformer based on the Nemotron Nano-V3 architecture.
-The model follows the standard transformer structure consisting of stacked
-attention and feedforward blocks with pre-normalization.
-
-\paragraph{Model configuration}
-Our final submitted model is a Mixture-of-Experts (MoE) variant trained on the full raw corpus (experiment \texttt{full\_raw\_moe}), with \textbf{1,409,471,232 total parameters} (390M active per token) and tied input/output embeddings. The architecture is summarized in Table~\ref{tab:model_config}.
+Our final submitted model is a \textbf{Mixture-of-Experts (MoE)} variant (experiment \texttt{full\_raw\_moe}) with 1.4B total parameters and 390M active per token. Table~\ref{tab:model_config} summarizes the configuration.
 
 \begin{table}[H]
 \centering
 \caption{Final model configuration (\texttt{full\_raw\_moe}).}
 \label{tab:model_config}
-\begin{tabular}{ll}
+\begin{tabular}{ll|ll}
 \toprule
-\textbf{Hyperparameter} & \textbf{Value} \\
+\textbf{Param} & \textbf{Value} & \textbf{Param} & \textbf{Value} \\
 \midrule
-Total parameters & 1,409,471,232 \\
-Active parameters per token & 390,255,360 \\
-Hidden size ($d_\text{model}$) & 768 \\
-Number of layers & 24 \\
-Attention heads ($H_Q$) & 12 \\
-KV heads ($H_{KV}$) & 4 (GQA group size 3) \\
-Intermediate size (SwiGLU, per expert) & 3,072 \\
-Number of experts & 8 \\
-Experts active per token (top-$k$) & 2 \\
-MoE auxiliary loss coefficient & 0.01 \\
-Context length & 2,048 \\
-RMSNorm $\epsilon$ & $10^{-5}$ \\
-RoPE $\theta$ & 10,000 \\
-Vocabulary size & 16,384 \\
-Tied embeddings & Yes \\
+Total params      & 1,409M   & Experts / active   & 8 / top-2 \\
+Active params     & 390M     & MoE aux loss       & 0.01 \\
+Hidden ($d$)      & 768      & Context length     & 2,048 \\
+Layers            & 24       & Vocab size         & 16,384 \\
+Attn heads / KV   & 12 / 4   & Tied embeddings    & Yes \\
+FFN per expert    & 3,072    & RoPE $\theta$      & 10,000 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The model uses Grouped-Query Attention (GQA) with 12 query heads and 4 key/value heads (a 3:1 grouping ratio), reducing KV cache memory during inference. Each MoE layer replaces the single dense feed-forward block with 8 expert MLPs, of which the top-2 are selected per token by a learned gating network. Each expert MLP uses a SwiGLU activation: two parallel projections (gate and up) followed by a down projection, i.e.\ $\text{MLP}(x) = W_\text{down}(\text{SiLU}(W_\text{gate} x) \odot W_\text{up} x)$. A load-balancing auxiliary loss ($\alpha=0.01$) encourages uniform expert utilization. Rotary position embeddings (RoPE) replace absolute position encodings, and RMSNorm is applied before each sub-layer (pre-norm). Input and output embeddings are tied.
+The model uses Grouped-Query Attention (GQA, 3:1 ratio), SwiGLU MLPs, RoPE, and RMSNorm pre-normalization. Each MoE layer replaces the dense FFN with 8 expert MLPs; a learned gating network selects the top-2 per token. A load-balancing auxiliary loss ($\alpha{=}0.01$) encourages uniform expert utilization. Input and output embeddings are tied.
 
-We also explored dense models at multiple scales---4M, 39M, 58M, and 382M parameters---as part of our scaling and ablation study (see Section~\ref{sec:training}).
+\paragraph{Scaling strategy.}
+Training occurs on a single node with 8$\times$H100 80\,GB GPUs.
+The MoE architecture scales total capacity to 1.4B parameters while keeping per-token compute equivalent to a 390M dense model.
+Our best model trains on ${\approx}$55B tokens over one epoch, yielding ${\approx}$141$\times$ tokens per active parameter---well beyond Chinchilla-optimal 20$\times$, appropriate given MoE's parameter efficiency.
+During early exploration we trained dense models at 4M, 39M, and 58M parameters following Chinchilla ratios (${\approx}$20$\times$) to validate the pipeline before scaling up (see Appendix~\ref{app:scaling}).
 
-\paragraph{Scaling strategy}
-Training occurs under a fixed compute budget of a single node with 8 H100 80GB GPUs.
-Given this constraint, we must balance model size against the number of tokens
-that can be processed during training.
-The MoE architecture allows us to scale total model capacity to 1.4B parameters while keeping per-token compute equivalent to a 390M dense model, effectively getting more capacity ``for free.''
-Our best model trains on $\approx$55B tokens of raw web and Wikipedia text over one epoch, yielding a tokens-per-active-parameter ratio of $\approx$141$\times$---well beyond the Chinchilla-optimal 20$\times$, which is appropriate given the MoE architecture's parameter efficiency.
-
-During early exploration, we trained smaller dense models following Chinchilla scaling: a 57.6M-parameter model (\texttt{scaled\_57M}) on 378M tokens over 3 epochs ($\approx$19.7$\times$ ratio) and a 38.8M model (\texttt{scaled\_38M}) on the same data over 2 epochs ($\approx$19.5$\times$ ratio).
-
+% =====================================================================
 \section{Tokenizer}
-We train the model using a byte-level BPE tokenizer with vocabulary size
-$|\mathcal{V}|= 16{,}384$, implemented with the HuggingFace \texttt{tokenizers} library.
-The tokenizer uses \texttt{ByteLevel} pre-tokenization and decoding, a minimum token frequency of 2, and three special tokens: \texttt{<|pad|>}, \texttt{<|eos|>}, and \texttt{<|unk|>}.
+% =====================================================================
 
-The tokenizer is trained on the curated hybrid training corpus to ensure that token boundaries reflect the distribution of the final training data. This reduces fragmentation and improves training efficiency compared to using a tokenizer trained on unrelated text.
+We use a byte-level BPE tokenizer ($|\mathcal{V}|{=}16{,}384$) trained on the hybrid corpus with the HuggingFace \texttt{tokenizers} library.
+Special tokens: \texttt{<|pad|>}, \texttt{<|eos|>}, \texttt{<|unk|>}; minimum frequency 2.
+Training on the target corpus reduces fragmentation vs.\ a generic tokenizer.
+The vocabulary size balances subword expressiveness with embedding cost ($16{,}384 \times 768 \approx 12.6$M tied parameters).
 
-Key tokenizer settings include byte-level encoding (handling arbitrary Unicode without an explicit normalization step), standard whitespace-aware pre-tokenization via \texttt{ByteLevel}, and inclusion of three special tokens required for language model training. The vocabulary size of 16,384 is selected to balance expressive subword capacity with embedding memory cost: the tied embedding table accounts for $16{,}384 \times 768 \approx 12.6$M parameters, a reasonable fraction of the total budget.
-
+% =====================================================================
 \section{Data}
-\subsection{Data Sources}
+% =====================================================================
+
+\subsection{Data Sources and Token Counts}
+
 Our training corpus begins with a large raw mixture of approximately
 25 million text documents stored as 256 sharded JSONL files.
 The raw dataset blends three complementary educational sources in a 70/20/10 ratio:
@@ -153,10 +128,8 @@ The raw dataset blends three complementary educational sources in a 70/20/10 rat
 \textbf{FinePDFs-Edu} (20\%, English), a PDF-extracted educational corpus; and
 \textbf{FineWiki} (10\%, English), a high-quality Wikipedia-derived dataset.
 All documents are normalized to a common schema with fields \texttt{id}, \texttt{title}, \texttt{text}, \texttt{source}, and \texttt{url}.
-This raw dataset contains significant duplication, formatting artifacts,
-and varying quality levels.
-
-Table~\ref{tab:dataset_tokens} summarizes the token counts for each dataset variant.
+We derive two additional variants via curation and synthetic augmentation.
+Table~\ref{tab:dataset_tokens} summarizes the token counts for each.
 
 \begin{table}[H]
 \centering
@@ -164,7 +137,7 @@ Table~\ref{tab:dataset_tokens} summarizes the token counts for each dataset vari
 \label{tab:dataset_tokens}
 \begin{tabular}{lrrr}
 \toprule
-\textbf{Dataset} & \textbf{Documents} & \textbf{Tokens} & \textbf{Tokens/Doc} \\
+\textbf{Dataset} & \textbf{Documents} & \textbf{Tokens} & \textbf{Tok/Doc} \\
 \midrule
 Raw     & 25,000,000 & $\approx$55B  & $\approx$2,200 \\
 Curated & 6,673,871  & $\approx$5.3B & $\approx$790   \\
@@ -174,227 +147,99 @@ Hybrid  & 8,673,295  & $\approx$8.8B & $\approx$1,015 \\
 \end{table}
 
 \subsection{Data Curation Pipeline}
+
 We construct a multi-stage curation pipeline using NVIDIA NeMo Curator.
 
-\paragraph{Unicode normalization and text cleaning}
-The first stage performs conservative mojibake repair (Latin-1 $\to$ UTF-8 re-decode when it reduces suspicious character counts), unescapes HTML entities, trims trailing reference/bibliography sections (``See also'', ``External links'', etc.), and normalizes whitespace while preserving paragraph structure. This ensures extraction artifacts and encoding corruption do not propagate into later stages.
+\paragraph{Unicode normalization and text cleaning.}
+The first stage performs conservative mojibake repair (Latin-1 $\to$ UTF-8 re-decode when it reduces suspicious character counts), unescapes HTML entities, trims trailing reference/bibliography sections, and normalizes whitespace while preserving paragraph structure.
 
-\paragraph{Heuristic filtering}
-Initial filtering removes documents with malformed Unicode,
-extreme character distributions, or abnormal formatting patterns.
-This stage eliminates obvious noise such as truncated documents,
-boilerplate artifacts, and corrupted text.
+\paragraph{Heuristic filtering.}
+Removes documents with malformed Unicode, extreme character distributions, or abnormal formatting patterns---eliminating truncated documents, boilerplate artifacts, and corrupted text.
 
-\paragraph{Exact deduplication}
-We remove exact duplicate documents to reduce memorization and
-improve dataset diversity.
+\paragraph{Exact and fuzzy deduplication.}
+Exact duplicates are removed by document hash. Near-duplicates are removed using MinHash LSH, eliminating templated pages and lightly modified copies.
 
-\paragraph{Fuzzy deduplication}
-Near-duplicate documents are removed using approximate similarity
-methods based on MinHash LSH. This removes templated pages and lightly modified copies
-of the same content.
+\paragraph{Benchmark decontamination.}
+Documents overlapping with evaluation benchmarks are filtered via $n$-gram matching to prevent train--test leakage.
 
-\paragraph{Benchmark decontamination}
-We filter documents that overlap with evaluation benchmarks using
-$n$-gram matching. This prevents train--test leakage and ensures
-evaluation metrics reflect generalization rather than memorization.
+\paragraph{Quality filtering.}
+Remaining documents are scored using an LLM-based quality classifier (fineweb-edu-classifier). Documents scoring below 3.0 are removed, producing the final curated dataset.
+Table~\ref{tab:curation-stages} shows document counts at each stage.
 
-\paragraph{Quality filtering}
-Remaining documents are scored using an LLM-based quality classifier [fineweb-edu-classifier].
-Documents classified as low quality [$<$ 3.0] are removed, producing the final curated dataset.
-
-\begin{table}[ht]
+\begin{table}[H]
 \centering
-\renewcommand{\arraystretch}{1.2}
-\begin{tabular}{|l|r|r|r|}
-\hline
-\textbf{Stage} & \textbf{Docs} & \textbf{Kept vs Previous} & \textbf{Dropped at Stage} \\ \hline
-Raw input & 25,000,000 & 100.00\% & 0 \\ \hline
-Map heuristic & 19,332,987 & 77.33\% & 5,667,013 \\ \hline
-Exact dedup & 18,189,241 & 94.08\% & 1,143,746 \\ \hline
-Fuzzy dedup & 17,706,979 & 97.35\% & 482,262 \\ \hline
-Benchmark contamination & 17,706,436 & 99.997\% & 543 \\ \hline
-Quality filter (final curated) & 6,673,871 & 37.69\% & 11,032,565 \\ \hline
-\end{tabular}
-\caption{Document counts across curation stages}
+\small
+\caption{Document counts across curation stages.}
 \label{tab:curation-stages}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Stage} & \textbf{Docs} & \textbf{Kept} & \textbf{Dropped} \\
+\midrule
+Raw input        & 25,000,000 & 100.0\% & --- \\
+Heuristic filter & 19,332,987 & 77.3\%  & 5,667,013 \\
+Exact dedup      & 18,189,241 & 94.1\%  & 1,143,746 \\
+Fuzzy dedup      & 17,706,979 & 97.4\%  & 482,262 \\
+Decontamination  & 17,706,436 & 100.0\% & 543 \\
+Quality filter   & 6,673,871  & 37.7\%  & 11,032,565 \\
+\bottomrule
+\end{tabular}
 \end{table}
 
 \subsection{Synthetic Data Generation}
 
 To improve coverage and diversify training signals, we generate
-synthetic data using a Data Designer pipeline backed by a locally-served
-\textbf{NVIDIA Nemotron-3-Nano-30B-A3B} (MoE, 3.2B active parameters) model running on 4 vLLM
-replicas (each TP=2) behind a HAProxy load balancer.
-
-We sample approximately 500k seed documents from the curated corpus
-and generate roughly 2 million synthetic examples using four prompt
-families:
-
+${\approx}$2M synthetic examples from ${\approx}$500k curated seed documents using a Data Designer pipeline backed by a locally-served
+\textbf{NVIDIA Nemotron-3-Nano-30B-A3B} (MoE, 3.2B active parameters) model running on 4 vLLM replicas (each TP=2) behind a HAProxy load balancer.
+Four prompt families are used:
 \begin{itemize}
 \item Open rewrites of existing content
 \item Pedagogical teaching-style explanations
 \item Question--answer pairs
 \item Atomic factual statements
 \end{itemize}
+These transformations increase linguistic diversity and encourage reasoning behavior.
+The final hybrid corpus combines curated text with ${\approx}$20\% synthetic content.
+See Appendix~\ref{app:synthetic} for representative examples.
 
-These transformations increase linguistic diversity and encourage
-reasoning and explanatory behavior in the model. Table~\ref{tab:synthetic-strategies}
-in the appendix shows representative examples of the synthetic data strategies
-and resulting text formats. Figure~\ref{fig:rewrite-prompts} in the appendix
-shows a screenshot of the rewrite prompts used to generate the synthetic text.
-
-\subsection{Final Training Mixture}
-
-The final training dataset combines curated real text and synthetic
-data, targeting roughly 20\% synthetic content.
-
-This mixture balances natural language distribution with structured
-instructional examples while maintaining strong perplexity on
-held-out validation data.
-
-% =============================================================================
-% Training, Evaluation, and Results sections
-% =============================================================================
-
+% =====================================================================
 \section{Training}
 \label{sec:training}
+% =====================================================================
 
-We conduct three groups of pre-training experiments, each designed to isolate a
-different axis of variation: model capacity, data quality at fixed compute, and
-the interaction between data source and model architecture at full scale.
-All runs use the Nemotron-Nano-V3 architecture family and are trained on
-8$\times$NVIDIA H100 80\,GB GPUs.
-
-\subsection{Architecture}
-\label{sec:architecture}
-
-\paragraph{Dense model.}
-Our dense baseline follows the Nemotron-Nano-V3 design: a decoder-only
-Transformer with Grouped-Query Attention (GQA), RMSNorm, SwiGLU activations,
-and Rotary Position Embeddings (RoPE). The 382M-parameter configuration uses
-a hidden dimension of 1024, 24 layers, 16 attention heads (4 key-value heads),
-an intermediate size of 4096, and a context length of 2048 tokens. Input and
-output embeddings are tied.
-
-\paragraph{Mixture-of-Experts (MoE) model.}
-The MoE variant replaces each dense feed-forward block with a top-2 gated
-mixture of 8 experts, yielding 1.4B total parameters but only 390M active
-parameters per token---roughly matching the dense model's per-token compute.
-We use a hidden dimension of 768, 24 layers, 12 attention heads (4 key-value
-heads), and an intermediate size of 3072 per expert. A load-balancing
-auxiliary loss ($\alpha=0.01$) encourages uniform expert utilization.
-
-\paragraph{Tokenizer.}
-All experiments share a 16K-vocabulary BPE tokenizer trained on the hybrid
-pre-training corpus.
+We conduct three groups of experiments on 8$\times$H100 80\,GB GPUs, isolating model capacity, data quality, and architecture effects.
 
 \subsection{Training Infrastructure}
-\label{sec:infra}
 
-Models are distributed across 8 GPUs using Fully Sharded Data Parallelism
-(FSDP2). We apply \texttt{torch.compile} for graph-level kernel fusion.
-Training uses bfloat16 mixed precision throughout.
+Models are distributed across 8 GPUs using Fully Sharded Data Parallelism (FSDP2). We apply \texttt{torch.compile} for graph-level kernel fusion. Training uses bfloat16 mixed precision throughout.
 
 \paragraph{Optimizer.}
-AdamW with $\beta_1=0.9$, $\beta_2=0.95$, $\epsilon=10^{-8}$, and weight
-decay $0.1$ (applied to all parameters except biases and layer norms).
-Gradients are clipped at a max norm of 1.0.
+AdamW with $\beta_1{=}0.9$, $\beta_2{=}0.95$, $\epsilon{=}10^{-8}$, and weight decay 0.1 (applied to all parameters except biases and layer norms). Gradients are clipped at a max norm of 1.0.
 
 \paragraph{Learning rate schedule.}
-Linear warmup over the first 1\% of training steps followed by cosine decay
-to $0.5\times$ the peak learning rate of $3\times10^{-4}$.
+Linear warmup over the first 1\% of training steps followed by cosine decay to $0.5\times$ the peak learning rate of $3{\times}10^{-4}$.
 
 \paragraph{Data loading.}
-Large datasets (raw, hybrid) are stored as pre-sharded JSONL files and
-consumed via a streaming data loader that tokenizes on-the-fly, avoiding the
-need to materialize the full tokenized corpus in memory. Smaller datasets
-(curated) are tokenized in memory at startup.
+Large datasets (raw, hybrid) are stored as pre-sharded JSONL files and consumed via a streaming data loader that tokenizes on-the-fly. Smaller datasets (curated) are tokenized in memory at startup.
 
-\subsection{Experiment Group 1: Model Scaling}
-\label{sec:group1}
+\subsection{Experiment Groups}
 
-The first group of experiments holds the data source constant (raw Wikipedia
-and web text) and varies model capacity from 4M to 58M parameters
-(Table~\ref{tab:group1}). These runs establish a baseline scaling trend and
-confirm that our training pipeline produces expected improvements with
-increased capacity.
+\paragraph{Group 1: Model scaling (4M--58M params).}
+Seven dense models on raw data, varying capacity from 4M to 58M parameters and data source at the 58M scale. These runs establish a baseline scaling trend and confirm that our pipeline produces expected improvements with increased capacity (see Appendix~\ref{app:scaling} for full table and results).
 
-\begin{table}[h]
-\centering
-\caption{Group 1: Model scaling experiments (raw data, dense architecture).}
-\label{tab:group1}
-\begin{tabular}{lccc}
-\toprule
-\textbf{Experiment} & \textbf{Params} & \textbf{Tokens} & \textbf{Steps} \\
-\midrule
-\texttt{baseline\_29k\_docs} & 4M   & 26M   & 597    \\
-\texttt{scaled\_38M}         & 39M  & 378M  & 720    \\
-\texttt{raw\_sub\_57M}       & 58M  & 328M  & 396    \\
-\texttt{curated\_57M}        & 58M  & 328M  & 936    \\
-\texttt{hybrid\_sub\_57M}    & 58M  & 328M  & 936    \\
-\texttt{scaled\_57M}         & 58M  & 378M  & 1,080  \\
-\texttt{raw\_full\_57M}      & 58M  & 5.7B  & 2,525  \\
-\bottomrule
-\end{tabular}
-\end{table}
+\paragraph{Group 2: Data quality at equal tokens.}
+Three 382M dense models trained on ${\approx}$5.7B tokens each (raw, curated, hybrid) to isolate data quality from quantity.
 
-We additionally vary data source at the 58M scale (raw, curated, hybrid,
-scaled subsets) to provide an early signal on data quality effects before
-committing to the larger runs in Groups 2 and 3.
+\paragraph{Group 3: Full-scale data $\times$ architecture.}
+Six runs forming a $3{\times}2$ grid: three data sources $\times$ two architectures (dense 382M / MoE 390M active, 1.4B total), each training for one full epoch.
+Table~\ref{tab:group3} summarizes the configurations.
 
-\subsection{Experiment Group 2: Data Quality at Equal Token Budget}
-\label{sec:group2}
-
-To isolate the effect of data quality from data quantity, we train three
-382M-parameter dense models on exactly 5.7B tokens each, drawn from
-different corpora (Table~\ref{tab:group2}). The curated corpus uses the
-full available curated data ($\approx$5.3B tokens); for raw and hybrid we
-subsample to match.
-
-\begin{table}[h]
-\centering
-\caption{Group 2: Equal-token data quality ablation (382M dense, 5.7B tokens each).}
-\label{tab:group2}
-\begin{tabular}{lccc}
-\toprule
-\textbf{Experiment} & \textbf{Data Source} & \textbf{Tokens} & \textbf{Steps} \\
-\midrule
-\texttt{equal5b\_raw\_dense}    & Raw     & 5.7B & 10,871 \\
-\texttt{full\_curated\_dense}   & Curated & 5.3B & 10,000 \\
-\texttt{equal5b\_hybrid\_dense} & Hybrid  & 5.7B & 10,871 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\paragraph{Data sources.}
-\begin{itemize}
-    \item \textbf{Raw}: A 25M-document mixture of FineWeb-Edu (17.5M),
-          FinePDFs-Edu (5M), and FineWiki (2.5M), totaling $\approx$55B
-          tokens.
-    \item \textbf{Curated}: Quality-filtered subset of the raw corpus
-          produced by perplexity filtering, deduplication, and domain
-          balancing, yielding $\approx$5.3B tokens.
-    \item \textbf{Hybrid}: The curated corpus augmented with
-          LLM-generated synthetic data (via NVIDIA Data Curator),
-          totaling $\approx$8.8B tokens.
-\end{itemize}
-
-\subsection{Experiment Group 3: Full-Scale Data $\times$ Architecture}
-\label{sec:group3}
-
-The final group trains both dense and MoE architectures on the full extent
-of each data source (Table~\ref{tab:group3}), producing a $3\times2$ grid
-of experiments that reveals how data quality and model architecture interact
-at scale. All models train for one full epoch over their respective corpus.
-
-\begin{table}[h]
+\begin{table}[H]
 \centering
 \caption{Group 3: Full-scale runs across data sources and architectures.}
 \label{tab:group3}
 \begin{tabular}{llcccc}
 \toprule
-\textbf{Data} & \textbf{Architecture} & \textbf{Total Params} & \textbf{Active Params} & \textbf{Tokens} & \textbf{Steps} \\
+\textbf{Data} & \textbf{Arch.} & \textbf{Total Params} & \textbf{Active Params} & \textbf{Tokens} & \textbf{Steps} \\
 \midrule
 Raw     & Dense & 382M  & 382M & 55.1B & 105,000 \\
 Raw     & MoE   & 1.4B  & 390M & 55.1B & 210,000 \\
@@ -406,49 +251,31 @@ Hybrid  & MoE   & 1.4B  & 390M & 6.6B  & 25,000  \\
 \end{tabular}
 \end{table}
 
-The MoE models use a global batch size of 128 (16 per GPU $\times$ 8 GPUs)
-while dense models use 256 (16 per GPU $\times$ 2 gradient accumulation
-steps $\times$ 8 GPUs), so that MoE runs see the same total tokens in
-roughly twice the number of steps. The raw-data runs train for significantly more steps due to the
-10$\times$ larger corpus, reaching lower final losses (1.69 for dense,
-1.70 for MoE) compared to the curated and hybrid runs ($\approx$2.4--3.1).
+The MoE models use a global batch size of 128 (16 per GPU $\times$ 8 GPUs) while dense models use 256 (16 per GPU $\times$ 2 gradient accumulation steps $\times$ 8 GPUs), so that MoE runs see the same total tokens in roughly twice the number of steps. The raw-data runs train for significantly more steps due to the 10$\times$ larger corpus, reaching lower final losses (1.69 for dense, 1.70 for MoE) compared to the curated and hybrid runs (${\approx}$2.4--3.1).
 
+\subsection{Hardware, Wall-Clock Time, and Stability}
+
+All training was performed on a single 8$\times$H100 80\,GB node. The largest run (raw MoE, 210K steps) took ${\approx}$49 hours wall-clock; the full-scale dense runs took ${\approx}$18 hours each; the equal-token and curated/hybrid runs completed in 1.5--2 hours each. Total compute across all 18 experiments: ${\approx}$150 GPU-hours.
+
+The raw MoE run experienced one NCCL collective timeout near step 200K due to transient inter-GPU communication failure. Training resumed from the most recent checkpoint (saved every 5K steps) with negligible impact on final loss. All other runs completed without issues.
+
+% =====================================================================
 \section{Evaluation}
 \label{sec:evaluation}
+% =====================================================================
 
-We evaluate all models using the EleutherAI LM Evaluation Harness, the
-same zero-shot benchmark backend used by NeMo Evaluator. Because our
-custom Nemotron-Nano architecture is not natively registered in the NeMo
-model zoo, we integrate with the harness directly: a custom wrapper class
-(\texttt{NemotronNanoEvalLM}) implements the \texttt{lm\_eval.api.model.LM}
-interface, providing batched log-likelihood scoring and greedy generation
-on top of our trained checkpoints. This produces results identical to
-those obtained through NeMo Evaluator's harness integration, while
-supporting our non-standard model class.
-
-Each checkpoint is evaluated by running:
-
-\begin{verbatim}
-python evaluate.py \
-  --checkpoint runs/<experiment>/best.pt \
-  --tokenizer_dir tokenizer_16k \
-  --tasks hellaswag,piqa,arc_easy,arc_challenge,\
-         winogrande,sciq,boolq,lambada_openai,wikitext \
-  --batch_size 64
-\end{verbatim}
+We evaluate all models zero-shot using the EleutherAI LM Evaluation Harness, the same backend used by NeMo Evaluator.
+A custom wrapper (\texttt{NemotronNanoEvalLM}) implements the \texttt{lm\_eval.api.model.LM} interface for our architecture.
 
 \subsection{Benchmarks}
 
-We select a suite of nine zero-shot tasks appropriate for base (non-chat)
-language models, covering commonsense reasoning, science, reading
-comprehension, and language modeling:
+We select a suite of nine zero-shot tasks appropriate for base (non-chat) language models:
 
 \paragraph{Accuracy benchmarks (higher is better).}
 \begin{itemize}
     \item \textbf{HellaSwag}: Commonsense sentence completion (acc\_norm).
     \item \textbf{PIQA}: Physical intuition QA (acc).
-    \item \textbf{ARC-Easy / ARC-Challenge}: Grade-school science
-          questions (acc\_norm).
+    \item \textbf{ARC-Easy / ARC-Challenge}: Grade-school science questions (acc\_norm).
     \item \textbf{SciQ}: Multiple-choice science QA (acc\_norm).
     \item \textbf{BoolQ}: Yes/no reading comprehension (acc).
     \item \textbf{WinoGrande}: Coreference resolution (acc).
@@ -457,74 +284,38 @@ comprehension, and language modeling:
 \paragraph{Perplexity benchmarks (lower is better).}
 \begin{itemize}
     \item \textbf{WikiText}: Word-level perplexity on WikiText-103.
-    \item \textbf{LAMBADA}: Perplexity on the LAMBADA last-word
-          prediction task.
+    \item \textbf{LAMBADA}: Perplexity on the LAMBADA last-word prediction task.
 \end{itemize}
 
 All evaluations use zero-shot prompting with no task-specific fine-tuning.
-Raw evaluation outputs are saved per-run in
-\texttt{runs/<experiment>/eval\_results.json}.
+Raw evaluation outputs are saved per-run in \texttt{runs/<experiment>/eval\_results.json}.
 
-\section{Results}
-\label{sec:results}
+\subsection{Results}
 
-\subsection{Group 1: Model Scaling}
+\paragraph{Group 1: Model scaling.}
+Scaling from 4M to 58M parameters yields consistent gains across all benchmarks, with particularly large improvements on SciQ ($+$25.8\,pp) and BoolQ ($+$5.0\,pp). At fixed 58M size, data source matters little except for SciQ where more data helps substantially. See Appendix~\ref{app:group1} for figures.
 
-Figure~\ref{fig:group1a} shows the effect of scaling model size from 4M to
-58M parameters on raw Wikipedia data. Larger models improve consistently
-across all benchmarks, with particularly large gains on SciQ
-($+$25.8\,pp from 4M to 58M) and BoolQ ($+$5.0\,pp).
+\paragraph{Group 2: Curation helps per-token.}
+At equal token budgets (${\approx}$5.7B), hybrid data wins 5/7 accuracy benchmarks (Figure~\ref{fig:group2_acc}, Table~\ref{tab:group2_results}), with ARC-C $+$4.9\,pp and ARC-E $+$5.5\,pp over raw. Raw retains an edge on perplexity (closer distribution to test sets). This confirms that \emph{at a fixed token budget, data curation and augmentation meaningfully improve downstream task performance}.
 
-\begin{figure}[h]
-\centering
-\includegraphics[width=\linewidth]{slides/group1a_model_size.pdf}
-\caption{Effect of model size on benchmark accuracy (raw data, dense
-architecture). Scaling from 4M to 58M parameters yields consistent
-improvements, confirming that model capacity is a primary performance driver.}
-\label{fig:group1a}
-\end{figure}
-
-At the fixed 58M model size, Figure~\ref{fig:group1b} compares five data
-source configurations. Performance differences are modest across most
-benchmarks, with the notable exception of SciQ where the full raw dataset
-(5.7B tokens) dramatically outperforms all subsets ($\approx$328M tokens),
-suggesting that data quantity dominates quality effects at this small model
-scale.
-
-\begin{figure}[h]
-\centering
-\includegraphics[width=\linewidth]{slides/group1b_data_source.pdf}
-\caption{Effect of data source and quantity at fixed 58M model size.
-Most benchmarks show little sensitivity to data source; SciQ is the
-exception, where more data helps substantially.}
-\label{fig:group1b}
-\end{figure}
-
-\subsection{Group 2: Data Quality at Equal Token Budget}
-
-When we control for token count (5.7B tokens each), data quality differences
-become clearly visible (Figure~\ref{fig:group2_acc},
-Table~\ref{tab:group2_results}).
-
-\begin{figure}[h]
+\begin{figure}[H]
 \centering
 \includegraphics[width=\linewidth]{slides/group2_equal_accuracy.pdf}
-\caption{Benchmark accuracy at equal token budget (5.7B tokens, 382M
-dense). Hybrid data outperforms both raw and curated on most benchmarks.}
+\caption{Benchmark accuracy at equal token budget (${\approx}$5.7B tokens, 382M dense). Hybrid data outperforms both raw and curated on most benchmarks.}
 \label{fig:group2_acc}
 \end{figure}
 
-\begin{table}[h]
+\begin{table}[H]
 \centering
-\caption{Group 2 results: accuracy (\%) and perplexity at 5.7B tokens.
-Best result per metric in \textbf{bold}.}
+\caption{Group 2: accuracy (\%) and perplexity at 5.7B tokens. Best in \textbf{bold}.}
 \label{tab:group2_results}
+\small
 \begin{tabular}{l*{7}{c}cc}
 \toprule
 & \rotatebox{60}{HellaSwag} & \rotatebox{60}{PIQA} & \rotatebox{60}{ARC-E}
 & \rotatebox{60}{ARC-C} & \rotatebox{60}{SciQ} & \rotatebox{60}{BoolQ}
-& \rotatebox{60}{WinoGrande} & \rotatebox{60}{WikiText$\downarrow$}
-& \rotatebox{60}{LAMBADA$\downarrow$} \\
+& \rotatebox{60}{WinoGrande} & \rotatebox{60}{WT$\downarrow$}
+& \rotatebox{60}{LAM$\downarrow$} \\
 \midrule
 Raw     & 31.3 & 61.4 & 45.5 & 24.9 & 61.2 & \textbf{62.1} & \textbf{50.9} & \textbf{36.2} & \textbf{82.0} \\
 Curated & 33.5 & 62.3 & 49.9 & 27.2 & 69.6 & 61.3 & 50.5 & 36.4 & 95.8 \\
@@ -533,40 +324,29 @@ Hybrid  & \textbf{33.3} & \textbf{64.1} & \textbf{51.0} & \textbf{29.8} & \textb
 \end{tabular}
 \end{table}
 
-The hybrid corpus achieves the best accuracy on 5 of 7 benchmarks,
-including substantial leads on ARC-Challenge ($+$4.9\,pp over raw) and
-ARC-Easy ($+$5.5\,pp over raw). Raw data retains an edge on perplexity
-metrics, likely because its distribution is closer to the WikiText and
-LAMBADA test sets. These results confirm that \emph{at a fixed token
-budget, data curation and augmentation meaningfully improve downstream
-task performance}.
+\paragraph{Group 3: Full-scale results.}
+Table~\ref{tab:group3_results} and Figure~\ref{fig:group3_acc} present the $3{\times}2$ grid.
 
-\subsection{Group 3: Full-Scale Data $\times$ Architecture}
-
-Table~\ref{tab:group3_results} and Figure~\ref{fig:group3_acc} present
-the full $3\times2$ grid of results.
-
-\begin{figure}[h]
+\begin{figure}[H]
 \centering
 \includegraphics[width=\linewidth]{slides/group3_fullscale_accuracy.pdf}
-\caption{Full-scale accuracy: Dense vs.\ MoE across three data sources.
-MoE consistently outperforms the matched dense model.}
+\caption{Full-scale accuracy: Dense vs.\ MoE across three data sources.}
 \label{fig:group3_acc}
 \end{figure}
 
-\begin{table}[h]
+\begin{table}[H]
 \centering
-\caption{Group 3 results: full-scale runs. Best per data source in
-\textbf{bold}; overall best \underline{underlined}.}
+\caption{Group 3 results. Best per data source in \textbf{bold}; overall best \underline{underlined}.}
 \label{tab:group3_results}
+\small
 \resizebox{\linewidth}{!}{%
 \begin{tabular}{ll*{7}{c}cc}
 \toprule
 \textbf{Data} & \textbf{Arch.}
 & \rotatebox{60}{HellaSwag} & \rotatebox{60}{PIQA} & \rotatebox{60}{ARC-E}
 & \rotatebox{60}{ARC-C} & \rotatebox{60}{SciQ} & \rotatebox{60}{BoolQ}
-& \rotatebox{60}{WinoGrande} & \rotatebox{60}{WikiText$\downarrow$}
-& \rotatebox{60}{LAMBADA$\downarrow$} \\
+& \rotatebox{60}{WinoGrande} & \rotatebox{60}{WT$\downarrow$}
+& \rotatebox{60}{LAM$\downarrow$} \\
 \midrule
 Raw     & Dense & 43.0 & 68.0 & 55.2 & 29.2 & 76.4 & 60.0 & 51.8 & 20.9 & 21.2 \\
 Raw     & MoE   & \underline{\textbf{49.1}} & \underline{\textbf{70.2}} & \underline{\textbf{59.6}} & \underline{\textbf{32.1}} & \underline{\textbf{79.6}} & \textbf{60.7} & \underline{\textbf{54.5}} & \underline{\textbf{17.6}} & \underline{\textbf{15.2}} \\
@@ -582,123 +362,61 @@ Hybrid  & MoE   & \textbf{38.5} & \textbf{66.2} & \textbf{57.6} & \textbf{31.7} 
 \end{table}
 
 \paragraph{Finding 1: Volume beats quality at scale.}
-The raw-data models dominate the overall leaderboard despite using
-unfiltered data. With $\approx$55B training tokens (10$\times$ the
-curated/hybrid corpora), the raw MoE achieves the best score on every
-benchmark. HellaSwag reaches 49.1\% (vs.\ 38.5\% for hybrid MoE),
-and WikiText perplexity drops to 17.6 (vs.\ 28.6). At current corpus
-sizes, we do not yet have enough curated data for quality to overcome
-the sheer advantage of quantity.
+The raw-data models dominate the overall leaderboard despite using unfiltered data. With ${\approx}$55B training tokens (10$\times$ the curated/hybrid corpora), the raw MoE achieves the best score on every benchmark. HellaSwag reaches 49.1\% (vs.\ 38.5\% for hybrid MoE), and WikiText perplexity drops to 17.6 (vs.\ 28.6). At current corpus sizes, we do not yet have enough curated data for quality to overcome the sheer advantage of quantity.
 
 \paragraph{Finding 2: Curation helps per-token.}
-Comparing the curated and hybrid columns against raw \emph{at similar
-token counts} (5--9B), hybrid data consistently outperforms raw:
-hybrid MoE beats curated MoE on 6 of 7 accuracy benchmarks and
-achieves 7.3 points lower WikiText perplexity than the corresponding
-dense model. This confirms that data curation and synthetic
-augmentation improve sample efficiency.
+Comparing curated and hybrid against raw \emph{at similar token counts} (5--9B), hybrid data consistently outperforms raw: hybrid MoE beats curated MoE on 6/7 accuracy benchmarks and achieves 7.3 points lower WikiText perplexity than the corresponding dense model.
 
 \paragraph{Finding 3: MoE $>$ Dense for free.}
-Across all three data sources, the MoE architecture improves over the
-matched dense model on nearly every metric, despite using the same
-number of active parameters per token. The gains are:
+Across all three data sources, MoE improves over the matched dense model on nearly every metric, despite using the same active parameters per token. The gains are:
 \begin{itemize}
     \item HellaSwag: $+$3.0 to $+$6.1\,pp
     \item PIQA: $+$2.2 to $+$2.4\,pp
     \item ARC-Easy: $+$2.3 to $+$4.5\,pp
     \item WikiText PPL: $-$3.3 to $-$7.3
 \end{itemize}
-The MoE advantage is largest on the raw corpus (where more training
-data allows the experts to specialize more effectively) and smallest
-on the curated corpus.
+The MoE advantage is largest on the raw corpus (where more data allows experts to specialize) and smallest on curated.
 
-\begin{figure}[h]
-\centering
-\includegraphics[width=0.85\linewidth]{slides/group3_heatmap.pdf}
-\caption{Heatmap of the $3\times2$ experimental grid. Each cell shows
-accuracy (\%) for a given benchmark; the rightmost column shows the
-average across all seven benchmarks. MoE consistently outperforms
-Dense within each data source.}
-\label{fig:group3_heatmap}
-\end{figure}
+\paragraph{Summary.}
+Our experiments reveal a clear hierarchy: (1)~data volume is the strongest lever at current scales, (2)~data curation improves sample efficiency when token budgets are matched, and (3)~sparse MoE routing provides a consistent ``free lunch'' over dense models at equivalent per-token compute. The best overall model---raw-data MoE with 1.4B total / 390M active parameters---achieves 49.1\% HellaSwag, 70.2\% PIQA, and 17.6 WikiText perplexity.
 
-Figure~\ref{fig:group3_ppl} shows the perplexity comparison. The
-pattern mirrors the accuracy results: raw-data models achieve the
-lowest perplexity, and MoE improves over dense in every case.
-
-\begin{figure}[h]
-\centering
-\includegraphics[width=\linewidth]{slides/group3_fullscale_perplexity.pdf}
-\caption{WikiText and LAMBADA perplexity for the six full-scale runs.
-Lower is better. MoE reduces perplexity across all data sources.}
-\label{fig:group3_ppl}
-\end{figure}
-
-\subsection{Summary}
-
-Our experiments reveal a clear hierarchy: (1)~data volume is the
-strongest lever at current scales, (2)~data curation improves
-sample efficiency when token budgets are matched, and (3)~sparse
-MoE routing provides a consistent ``free lunch'' over dense models
-at equivalent per-token compute. The best overall model---raw-data
-MoE with 1.4B total parameters and 390M active---achieves 49.1\%
-HellaSwag, 70.2\% PIQA, and 17.6 WikiText perplexity.
-
-\section{Reproducibility}
+% =====================================================================
+\section{Reproducibility and Checkpoint Retention}
 \label{sec:reproducibility}
+% =====================================================================
 
-All code, configurations, and checkpoints are contained in the repository.
+\paragraph{Best checkpoint.}
+\texttt{runs/full\_raw\_moe/best.pt} (raw-data MoE, 1.4B params, 390M active).
 
-\paragraph{Best model checkpoint.}
-Our best-performing model is the full-scale raw-data MoE
-(\texttt{full\_raw\_moe}), stored at \texttt{runs/full\_raw\_moe/best.pt}.
-
-\paragraph{Training.}
-Any experiment can be reproduced with:
+\paragraph{Commands.}
 \begin{verbatim}
+# Train
 torchrun --nproc_per_node=8 pretrain.py \
-  --config configs/<experiment>.yaml
-\end{verbatim}
-For example, to reproduce the best model:
-\begin{verbatim}
-torchrun --nproc_per_node=8 pretrain.py \
+  --config configs/full_raw_moe.yaml
+
+# Evaluate
+python evaluate.py \
+  --checkpoint runs/full_raw_moe/best.pt \
+  --tokenizer_dir tokenizer_16k --batch_size 64
+
+# Save results JSON
+python save_experiment.py \
   --config configs/full_raw_moe.yaml
 \end{verbatim}
 
-\paragraph{Evaluation.}
-After training, evaluate and save results:
-\begin{verbatim}
-python evaluate.py \
-  --checkpoint runs/<experiment>/best.pt \
-  --tokenizer_dir tokenizer_16k \
-  --batch_size 64
-
-python save_experiment.py \
-  --config configs/<experiment>.yaml
-\end{verbatim}
-
 \paragraph{Dependencies.}
-Training requires PyTorch $\geq$ 2.2 with CUDA 12.x, 8$\times$H100 80\,GB GPUs,
-and the \texttt{lm-evaluation-harness} package (\texttt{pip install lm-eval}).
-The tokenizer is stored in \texttt{tokenizer\_16k/}.
-All experiment YAML configs are in \texttt{configs/} and all results JSONs
-are in \texttt{experiments/}.
+PyTorch $\geq$ 2.2, CUDA 12.x, 8$\times$H100 GPUs, \texttt{pip install lm-eval}.
 
-\paragraph{Repository structure.}
-\begin{verbatim}
-pretrain.py          # training script
-evaluate.py          # evaluation wrapper
-save_experiment.py   # compile results JSON
-configs/             # YAML configs for all runs
-runs/                # checkpoints + train logs
-experiments/         # final results JSONs
-tokenizer_16k/       # BPE tokenizer files
-\end{verbatim}
+\paragraph{Repository layout.}
+\texttt{pretrain.py} (training), \texttt{evaluate.py} (eval wrapper), \texttt{save\_experiment.py} (results compiler), \texttt{configs/} (YAML configs), \texttt{runs/} (checkpoints + logs), \texttt{experiments/} (results JSONs), \texttt{tokenizer\_16k/} (tokenizer).
 
+% =====================================================================
 \newpage
 \appendix
-\section{Appendix: Part A}
-\subsection{NeMo Curator Lab}
+% =====================================================================
+
+\section{Part A: NeMo Curator Lab}
+\label{app:curator}
 
 \paragraph{Objective}
 The NeMo Curator lab explored downloading, processing, and curating a domain-specific slice of English Wikipedia using the NVIDIA NeMo Curator framework. The goal was to build a clean, deduplicated corpus for a chosen domain and evaluate whether curation measurably improves text quality via perplexity.
@@ -712,9 +430,9 @@ Wikipedia data was downloaded from the February 2026 English dump (\texttt{enwik
 \paragraph{Curation pipeline}
 The curation pipeline (\texttt{wiki\_curation\_pipeline}) applied three sequential stages before deduplication:
 \begin{itemize}
-  \item \textbf{UnicodeReformatter} — fixed mojibake and encoding artifacts using \texttt{ftfy}.
-  \item \textbf{NewlineNormalizer} — collapsed 3+ consecutive newlines to 2, standardizing paragraph structure.
-  \item \textbf{WordCountFilter} (50--10,000 words) — removed stubs and oversized disambiguation pages.
+  \item \textbf{UnicodeReformatter} --- fixed mojibake and encoding artifacts using \texttt{ftfy}.
+  \item \textbf{NewlineNormalizer} --- collapsed 3+ consecutive newlines to 2, standardizing paragraph structure.
+  \item \textbf{WordCountFilter} (50--10,000 words) --- removed stubs and oversized disambiguation pages.
 \end{itemize}
 An \texttt{ExactDeduplicationWorkflow} then hashed each document's text to remove identical copies. No duplicates were found in this small sample, so the final curated dataset contained \textbf{6 documents} (one was dropped by the word-count filter).
 
@@ -728,9 +446,10 @@ A \texttt{PerplexityScorer} Curator stage loaded GPT-2 on a GPU worker and compu
 \label{fig:curator_ppl}
 \end{figure}
 
-The curated corpus achieved a mean GPT-2 perplexity of \textbf{36.8} vs.\ \textbf{39.4} for the raw domain subset — a modest improvement consistent with removing one outlier stub-like document via the word-count filter.
+The curated corpus achieved a mean GPT-2 perplexity of \textbf{36.8} vs.\ \textbf{39.4} for the raw domain subset --- a modest improvement consistent with removing one outlier stub-like document via the word-count filter.
 
-\subsection{NeMo Data Designer Lab}
+\section{Part A: NeMo Data Designer Lab}
+\label{app:designer}
 
 \paragraph{Objective}
 The Data Designer lab built a synthetic pre-training data pipeline using NVIDIA NeMo Data Designer, backed by a locally-served \textbf{Nemotron-3-Nano-30B-A3B} (MoE, 3.2B active parameters) inference server. The goal was to augment the curated Wikipedia corpus with diverse rephrased variants to increase training signal per seed document.
@@ -762,13 +481,13 @@ A structured QA strategy generated exactly 3 grounded question--answer pairs per
 A four-strategy pipeline was assembled to maximize linguistic diversity per seed document, following the BeyondWeb approach of applying multiple independent rephrasing transforms:
 
 \begin{itemize}
-  \item \textbf{distill} — concise summary retaining only the core concepts ($\approx$602 output tokens/doc).
-  \item \textbf{knowledge\_extract} — verbatim-style extraction of key facts and definitions ($\approx$2,009 tokens/doc).
-  \item \textbf{knowledge\_list} — numbered lists of atomic factual statements ($\approx$1,004 tokens/doc).
-  \item \textbf{diverse\_qa} — structured QA pairs as above ($\approx$803 tokens/doc).
+  \item \textbf{distill} --- concise summary retaining only the core concepts ($\approx$602 output tokens/doc).
+  \item \textbf{knowledge\_extract} --- verbatim-style extraction of key facts and definitions ($\approx$2,009 tokens/doc).
+  \item \textbf{knowledge\_list} --- numbered lists of atomic factual statements ($\approx$1,004 tokens/doc).
+  \item \textbf{diverse\_qa} --- structured QA pairs as above ($\approx$803 tokens/doc).
 \end{itemize}
 
-Figure~\ref{fig:multistrategy} shows the per-strategy compute cost. The total pipeline consumed $1.43 \times 10^{15}$ FLOPs across all 18 seed documents — approximately \textbf{3.1$\times$} the cost of a single-strategy run — with an estimated wall-clock time under 0.5~ms on 4$\times$H100 at observed MFU.
+Figure~\ref{fig:multistrategy} shows the per-strategy compute cost. The total pipeline consumed $1.43 \times 10^{15}$ FLOPs across all 18 seed documents --- approximately \textbf{3.1$\times$} the cost of a single-strategy run --- with an estimated wall-clock time under 0.5~ms on 4$\times$H100 at observed MFU.
 
 \begin{figure}[H]
 \centering
@@ -780,9 +499,10 @@ Figure~\ref{fig:multistrategy} shows the per-strategy compute cost. The total pi
 \paragraph{Takeaway}
 The Data Designer lab demonstrated that a locally-served MoE model can produce high-quality, diverse synthetic training documents at minimal additional compute cost relative to dense alternatives. The multi-strategy approach converts each seed document into 4 distinct training examples, effectively quadrupling the usable training corpus while preserving factual grounding (faithfulness 5.0/5) and improving linguistic fluency (perplexity 41.2 $\to$ 25.7).
 
-\section{Appendix: Scaling Configurations}
+\section{Scaling Configurations}
+\label{app:scaling}
 
-Table~\ref{tab:all_configs} summarizes all model configurations explored in Part B.
+Table~\ref{tab:all_configs} summarizes all model configurations explored during early scaling experiments in Part B.
 
 \begin{table}[H]
 \centering
@@ -799,9 +519,90 @@ scaled\_57M & 57.6M & 576 & 10 & 2304 & 378.2M & 3 & 3.948 \\
 \end{tabular}
 \end{table}
 
-\section{Appendix: Data Ablation Results}
+Table~\ref{tab:group1} lists all Group 1 model scaling experiments, which hold the dense architecture constant and vary model size and data source.
 
-Table~\ref{tab:data_ablation} shows all data ablation experiments run with the 57.6M architecture.
+\begin{table}[H]
+\centering
+\caption{Group 1: Model scaling experiments (raw data, dense architecture).}
+\label{tab:group1}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Experiment} & \textbf{Params} & \textbf{Tokens} & \textbf{Steps} \\
+\midrule
+\texttt{baseline\_29k\_docs} & 4M   & 26M   & 597    \\
+\texttt{scaled\_38M}         & 39M  & 378M  & 720    \\
+\texttt{raw\_sub\_57M}       & 58M  & 328M  & 396    \\
+\texttt{curated\_57M}        & 58M  & 328M  & 936    \\
+\texttt{hybrid\_sub\_57M}    & 58M  & 328M  & 936    \\
+\texttt{scaled\_57M}         & 58M  & 378M  & 1,080  \\
+\texttt{raw\_full\_57M}      & 58M  & 5.7B  & 2,525  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:group2_config} lists the Group 2 equal-token data quality ablation experiments.
+
+\begin{table}[H]
+\centering
+\caption{Group 2: Equal-token data quality ablation (382M dense).}
+\label{tab:group2_config}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Experiment} & \textbf{Data Source} & \textbf{Tokens} & \textbf{Steps} \\
+\midrule
+\texttt{equal5b\_raw\_dense}    & Raw     & 5.7B & 10,871 \\
+\texttt{full\_curated\_dense}   & Curated & 5.3B & 10,000 \\
+\texttt{equal5b\_hybrid\_dense} & Hybrid  & 5.7B & 10,871 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Group 1 Results: Model Scaling}
+\label{app:group1}
+
+Figure~\ref{fig:group1a} shows the effect of scaling model size from 4M to 58M parameters on raw Wikipedia data. Larger models improve consistently across all benchmarks, with particularly large gains on SciQ ($+$25.8\,pp from 4M to 58M) and BoolQ ($+$5.0\,pp).
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{slides/group1a_model_size.pdf}
+\caption{Effect of model size on benchmark accuracy (raw data, dense architecture). Scaling from 4M to 58M parameters yields consistent improvements, confirming that model capacity is a primary performance driver.}
+\label{fig:group1a}
+\end{figure}
+
+At the fixed 58M model size, Figure~\ref{fig:group1b} compares five data source configurations. Performance differences are modest across most benchmarks, with the notable exception of SciQ where the full raw dataset (5.7B tokens) dramatically outperforms all subsets ($\approx$328M tokens), suggesting that data quantity dominates quality effects at this small model scale.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{slides/group1b_data_source.pdf}
+\caption{Effect of data source and quantity at fixed 58M model size. Most benchmarks show little sensitivity to data source; SciQ is the exception, where more data helps substantially.}
+\label{fig:group1b}
+\end{figure}
+
+\section{Additional Full-Scale Results}
+\label{app:additional}
+
+Figure~\ref{fig:group3_heatmap} provides a compact heatmap view of the $3\times2$ experimental grid, showing accuracy for each benchmark as well as the average across all seven benchmarks. MoE consistently outperforms Dense within each data source.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\linewidth]{slides/group3_heatmap.pdf}
+\caption{Heatmap of the $3{\times}2$ experimental grid. Each cell shows accuracy (\%) for a given benchmark; the rightmost column shows the average across all seven benchmarks. MoE consistently outperforms Dense within each data source.}
+\label{fig:group3_heatmap}
+\end{figure}
+
+Figure~\ref{fig:group3_ppl} shows the perplexity comparison across all six full-scale runs. The pattern mirrors the accuracy results: raw-data models achieve the lowest perplexity, and MoE improves over dense in every case.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{slides/group3_fullscale_perplexity.pdf}
+\caption{WikiText and LAMBADA perplexity for the six full-scale runs. Lower is better. MoE reduces perplexity across all data sources.}
+\label{fig:group3_ppl}
+\end{figure}
+
+\section{Data Ablation Results (57.6M Model)}
+\label{app:data_ablation}
+
+Table~\ref{tab:data_ablation} shows all data ablation experiments run with the 57.6M-parameter dense architecture during early exploration. These results provided the initial signal that data quantity (raw\_full\_57M) dominates data quality at small model scales, motivating the larger-scale experiments in Groups 2 and 3.
 
 \begin{table}[H]
 \centering
@@ -820,21 +621,22 @@ scaled\_57M & Full hybrid, 399K docs, 378M tok (3 ep) & 3.948 & 250.9 \\
 \end{tabular}
 \end{table}
 
-\section{Appendix: Training Loss Curves}
+\section{Training Loss Curves}
+\label{app:loss}
 
-Figure~\ref{fig:appendix_loss} shows smoothed training loss curves for all
-full-scale runs, grouped by experiment type.
+Figure~\ref{fig:appendix_loss} shows smoothed training loss curves for all full-scale runs, grouped by experiment type. The left panel shows the equal-token dense runs (Group 2), where all three data sources converge to similar final losses ($\approx$2.5--2.7) despite different trajectories. The center panel shows the full-scale dense runs, where the raw-data model trains for 10$\times$ more steps and reaches a substantially lower final loss (1.69). The right panel shows the full-scale MoE runs, which exhibit higher initial loss (due to the gating network warming up) but converge to comparable or lower final losses than their dense counterparts.
 
 \begin{figure}[H]
 \centering
 \includegraphics[width=\linewidth]{slides/appendix_loss_curves.pdf}
-\caption{Training loss curves (smoothed) for Groups 2 and 3. Left: equal-token
-dense runs (5.7B tokens). Center: full-scale dense runs. Right: full-scale MoE
-runs. Colors indicate data source: blue = raw, orange = curated, green = hybrid.}
+\caption{Smoothed training loss curves for Groups 2 and 3. Left: equal-token dense runs (5.7B tokens). Center: full-scale dense runs. Right: full-scale MoE runs. Colors indicate data source: blue = raw, orange = curated, green = hybrid.}
 \label{fig:appendix_loss}
 \end{figure}
 
-\section{Synthetic data strategy examples}
+\section{Synthetic Data Strategy Examples}
+\label{app:synthetic}
+
+Table~\ref{tab:synthetic-strategies} shows representative examples of each synthetic data generation strategy used in the Data Designer pipeline. Each strategy produces a distinct text format from the same seed document, increasing linguistic diversity in the training corpus.
 
 \begin{table}[H]
 \centering
@@ -875,7 +677,8 @@ diverse\_qa\_text & fineweb\_edu &
 \label{tab:synthetic-strategies}
 \end{table}
 
-\section{Rewrite prompt screenshot}
+\section{Rewrite Prompt Screenshot}
+\label{app:prompts}
 
 \begin{figure}[H]
 \centering
